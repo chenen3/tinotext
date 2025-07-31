@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"container/list"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"slices"
@@ -19,7 +21,7 @@ const (
 type App struct {
 	data    *Model
 	tab     View
-	editor  []*View
+	editor  []*View // viewport
 	status  View
 	console View
 	cmdCh   chan string
@@ -29,24 +31,40 @@ type App struct {
 
 // Model holds the application state.
 type Model struct {
-	tabs    []string
-	tabIdx  int
-	lines   *list.List
+	tabs   []string
+	tabIdx int
+
+	lines  *list.List
+	row    int // start from 0
+	col    int // start from 0
+	scroll int // Scroll position for the editor
+
 	status  string
 	console *lineBuf
-
-	scroll int // Scroll position for the editor
 }
 
-func (m *Model) addTab(s string) {
-	i := slices.Index(m.tabs, s)
-	if i >= 0 {
-		m.tabIdx = i
-		return
+// line return the lineBuf in list
+func (m *Model) line(i int) *lineBuf {
+	if m.lines.Len() == 0 || i > m.lines.Len()-1 {
+		return nil
 	}
-	m.tabs = append(m.tabs, s)
-	m.tabIdx = len(m.tabs) - 1
+
+	l := m.lines.Front()
+	for range i {
+		l = l.Next()
+	}
+	return l.Value.(*lineBuf)
 }
+
+// func (m *Model) addTab(s string) {
+// 	i := slices.Index(m.tabs, s)
+// 	if i >= 0 {
+// 		m.tabIdx = i
+// 		return
+// 	}
+// 	m.tabs = append(m.tabs, s)
+// 	m.tabIdx = len(m.tabs) - 1
+// }
 
 func (m *Model) deleteTab(s string) {
 	for i, tab := range m.tabs {
@@ -72,11 +90,16 @@ func LineBuf(s string) *lineBuf {
 	}
 }
 
+func (l *lineBuf) String() string {
+	return string(l.line)
+}
+
 func (l *lineBuf) set(s string) {
 	l.line = []rune(s)
 	l.cursor = len(l.line)
 }
 
+// insert at inner cursor
 func (l *lineBuf) insert(r rune) {
 	if l.cursor >= len(l.line) {
 		l.line = append(l.line, r)
@@ -86,11 +109,13 @@ func (l *lineBuf) insert(r rune) {
 	l.cursor++
 }
 
-func (l *lineBuf) delete() {
-	if l.cursor > 0 {
-		l.cursor--
-		l.line = slices.Delete(l.line, l.cursor, l.cursor+1)
+// backspace delete backwards
+func (l *lineBuf) backspace() {
+	if l.cursor == 0 {
+		return
 	}
+	l.line = slices.Delete(l.line, l.cursor-1, l.cursor)
+	l.cursor--
 }
 
 // Move the cursor to the right, if possible.
@@ -102,9 +127,22 @@ func (l *lineBuf) right() {
 
 // Move the cursor to the left, if possible.
 func (l *lineBuf) left() {
-	if l.cursor > 0 {
-		l.cursor--
+	if l.cursor == 0 {
+		return
 	}
+	l.cursor--
+}
+
+// seek move the cursor and return it
+func (l *lineBuf) seek(i int) int {
+	if i < 0 {
+		i = 0
+	} else if i > len(l.line)-1 {
+		// line end
+		i = len(l.line)
+	}
+	l.cursor = i
+	return i
 }
 
 type View struct {
@@ -175,9 +213,13 @@ func (a *App) drawTabs() {
 
 func (a *App) drawEditor() {
 	line := a.data.lines.Front()
+	for range a.data.scroll {
+		line = line.Next()
+	}
+	remainlines := a.data.lines.Len() - a.data.scroll
 	for i, lineView := range a.editor {
-		if i < a.data.lines.Len() {
-			lineView.draw(line.Value.(string))
+		if i < remainlines {
+			lineView.draw(line.Value.(*lineBuf).String())
 			line = line.Next()
 		} else {
 			lineView.draw("")
@@ -189,7 +231,9 @@ var screen tcell.Screen
 
 func main() {
 	output := os.Getenv("SEYI_LOG_FILE")
-	if output != "" {
+	if output == "" {
+		log.SetOutput(io.Discard)
+	} else {
 		f, err := os.OpenFile(output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			log.Fatalf("Failed to open log file %s: %v", output, err)
@@ -228,7 +272,6 @@ func main() {
 
 	app := &App{
 		data: &Model{
-			// tabs:    []string{"Tab1", "Tab2", "Tab3"},
 			lines:   list.New(),
 			status:  "Ready",
 			console: LineBuf("Type a command here..."),
@@ -236,8 +279,6 @@ func main() {
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
 	}
-	app.data.lines.PushBack("This is app simple text editor.")
-	app.data.lines.PushBack("You can add more lines here.")
 	go app.handleCommand()
 
 	// Event loop
@@ -266,7 +307,7 @@ func main() {
 				continue
 			}
 			if app.focus == focusConsole {
-				app.consoleInput(ev)
+				app.consoleEvent(ev)
 				app.syncCursor()
 				continue
 			}
@@ -276,17 +317,41 @@ func main() {
 			case tcell.Button1: // left click
 				app.handleClick(x, y)
 			case tcell.ButtonNone: // drag
+			case tcell.WheelUp:
+				app.data.scroll -= int(float32(y) * scrollFactor)
+				if app.data.scroll < 0 {
+					app.data.scroll = 0
+				}
+				app.drawEditor()
+				app.syncCursor()
+			case tcell.WheelDown:
+				app.data.scroll += int(float32(y) * scrollFactor)
+				// keep it viewport
+				if app.data.scroll > app.data.lines.Len()-len(app.editor) {
+					app.data.scroll = app.data.lines.Len() - len(app.editor)
+				}
+				app.drawEditor()
+				app.syncCursor()
 			}
 		}
 	}
 }
 
+func (a *App) switchTab() {
+	// TODO: reset scroll position, open tab
+}
+
+// A multiplier to be used on scrolling
+const scrollFactor = 0.125
+
 func (a *App) handleClick(x, y int) {
 	if a.tab.contains(x, y) {
 		var width int
-		for _, tab := range a.data.tabs {
+		for i, tab := range a.data.tabs {
 			if x < a.tab.x+width+len(tab) {
-				a.cmdCh <- "open " + tab
+				if i != a.data.tabIdx {
+					a.cmdCh <- "open " + tab
+				}
 				return
 			} else if x < a.tab.x+width+len(tab)+len(tabCloser) {
 				a.cmdCh <- "close " + tab
@@ -294,13 +359,32 @@ func (a *App) handleClick(x, y int) {
 			}
 			width += len(tab) + len(tabCloser)
 		}
-	} else if a.console.contains(x, y) {
+		return
+	}
+
+	if a.console.contains(x, y) {
 		a.focus = focusConsole
 		a.setConsole("")
 		a.syncCursor()
-	} else {
-		a.focus = focusEditor
+		return
 	}
+
+	a.focus = focusEditor
+	if a.data.lines.Len() == 0 {
+		a.data.row = 0
+		a.data.col = 0
+	} else {
+		row := y - a.editor[0].y + a.data.scroll
+		if row > a.data.lines.Len()-1 {
+			row = a.data.lines.Len() - 1
+		}
+		a.data.row = row
+		line := a.data.line(a.data.row)
+		col := x - a.editor[0].x
+		a.data.col = line.seek(col)
+	}
+	a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
+	a.syncCursor()
 }
 
 // setStatus updates the status view with the given string.
@@ -315,7 +399,7 @@ func (a *App) setConsole(s string) {
 	a.console.draw("> " + s)
 }
 
-func (a *App) consoleInput(ev *tcell.EventKey) {
+func (a *App) consoleEvent(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEnter:
 		if len(a.data.console.line) > 0 {
@@ -324,7 +408,7 @@ func (a *App) consoleInput(ev *tcell.EventKey) {
 		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if len(a.data.console.line) > 0 {
-			a.data.console.delete()
+			a.data.console.backspace()
 		}
 	case tcell.KeyLeft:
 		a.data.console.left()
@@ -338,6 +422,34 @@ func (a *App) consoleInput(ev *tcell.EventKey) {
 	a.console.draw("> " + string(a.data.console.line))
 }
 
+func (m *Model) openTab(s string) error {
+	bs, err := os.ReadFile(s)
+	if err != nil {
+		return err
+	}
+
+	i := slices.Index(m.tabs, s)
+	if i < 0 {
+		m.tabs = append(m.tabs, s)
+		m.tabIdx = len(m.tabs) - 1
+	} else {
+		m.tabIdx = i
+	}
+
+	m.lines.Init()
+	for _, line := range bytes.Split(bs, []byte{'\n'}) {
+		m.lines.PushBack(LineBuf(string(line)))
+	}
+	return nil
+}
+
+/*
+>open file
+>close tab
+>find word
+:line
+@symbol
+*/
 func (a *App) handleCommand() {
 	for {
 		select {
@@ -350,17 +462,16 @@ func (a *App) handleCommand() {
 					a.setStatus("Usage: open <filename>")
 					continue
 				}
+
 				filename := c[1]
-				bs, err := os.ReadFile(filename)
+				err := a.data.openTab(filename)
 				if err != nil {
 					log.Println(err)
+					a.setStatus(err.Error())
+					screen.Show()
 					continue
 				}
-				a.data.addTab(filename)
-				a.data.lines.Init()
-				for _, line := range bytes.Split(bs, []byte{'\n'}) {
-					a.data.lines.PushBack(string(line))
-				}
+
 				a.focus = focusEditor
 				a.draw()
 				a.syncCursor()
@@ -391,9 +502,12 @@ func (a *App) handleCommand() {
 				}
 				a.data.lines.Init()
 				for _, line := range bytes.Split(bs, []byte{'\n'}) {
-					a.data.lines.PushBack(string(line))
+					a.data.lines.PushBack(LineBuf(string(line)))
 				}
 				a.draw()
+				screen.Show()
+			default:
+				a.setStatus("unknown command: " + cmd)
 				screen.Show()
 			}
 		case <-a.done:
@@ -403,9 +517,17 @@ func (a *App) handleCommand() {
 }
 
 func (a *App) syncCursor() {
-	if a.focus == focusConsole {
+	switch a.focus {
+	case focusEditor:
+		if a.data.row < a.data.scroll || a.data.row > (a.data.scroll+len(a.editor)) {
+			// out of viewport
+			screen.HideCursor()
+			return
+		}
+		screen.ShowCursor(a.editor[0].x+a.data.col, a.editor[0].y+a.data.row)
+	case focusConsole:
 		screen.ShowCursor(a.console.x+2+a.data.console.cursor, a.console.y)
-	} else {
+	default:
 		screen.HideCursor()
 	}
 }
