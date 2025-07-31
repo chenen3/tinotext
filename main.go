@@ -56,15 +56,29 @@ func (m *Model) line(i int) *lineBuf {
 	return l.Value.(*lineBuf)
 }
 
-// func (m *Model) addTab(s string) {
-// 	i := slices.Index(m.tabs, s)
-// 	if i >= 0 {
-// 		m.tabIdx = i
-// 		return
-// 	}
-// 	m.tabs = append(m.tabs, s)
-// 	m.tabIdx = len(m.tabs) - 1
-// }
+func (m *Model) openTab(s string) error {
+	bs, err := os.ReadFile(s)
+	if err != nil {
+		return err
+	}
+
+	i := slices.Index(m.tabs, s)
+	if i < 0 {
+		m.tabs = append(m.tabs, s)
+		m.tabIdx = len(m.tabs) - 1
+	} else {
+		m.tabIdx = i
+	}
+
+	m.lines.Init()
+	for _, line := range bytes.Split(bs, []byte{'\n'}) {
+		m.lines.PushBack(LineBuf(string(line)))
+	}
+	m.scroll = 0
+	m.row = 0
+	m.col = 0
+	return nil
+}
 
 func (m *Model) deleteTab(s string) {
 	for i, tab := range m.tabs {
@@ -306,11 +320,13 @@ func main() {
 				app.syncCursor()
 				continue
 			}
+
 			if app.focus == focusConsole {
 				app.consoleEvent(ev)
 				app.syncCursor()
 				continue
 			}
+			app.editorEvent(ev)
 		case *tcell.EventMouse:
 			x, y := ev.Position()
 			switch ev.Buttons() {
@@ -335,10 +351,6 @@ func main() {
 			}
 		}
 	}
-}
-
-func (a *App) switchTab() {
-	// TODO: reset scroll position, open tab
 }
 
 // A multiplier to be used on scrolling
@@ -422,27 +434,6 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 	a.console.draw("> " + string(a.data.console.line))
 }
 
-func (m *Model) openTab(s string) error {
-	bs, err := os.ReadFile(s)
-	if err != nil {
-		return err
-	}
-
-	i := slices.Index(m.tabs, s)
-	if i < 0 {
-		m.tabs = append(m.tabs, s)
-		m.tabIdx = len(m.tabs) - 1
-	} else {
-		m.tabIdx = i
-	}
-
-	m.lines.Init()
-	for _, line := range bytes.Split(bs, []byte{'\n'}) {
-		m.lines.PushBack(LineBuf(string(line)))
-	}
-	return nil
-}
-
 /*
 >open file
 >close tab
@@ -519,15 +510,74 @@ func (a *App) handleCommand() {
 func (a *App) syncCursor() {
 	switch a.focus {
 	case focusEditor:
-		if a.data.row < a.data.scroll || a.data.row > (a.data.scroll+len(a.editor)) {
+		if a.data.row < a.data.scroll || a.data.row > (a.data.scroll+len(a.editor)-1) {
 			// out of viewport
 			screen.HideCursor()
 			return
 		}
-		screen.ShowCursor(a.editor[0].x+a.data.col, a.editor[0].y+a.data.row)
+		screen.ShowCursor(a.editor[0].x+a.data.col, a.editor[0].y+a.data.row-a.data.scroll)
 	case focusConsole:
 		screen.ShowCursor(a.console.x+2+a.data.console.cursor, a.console.y)
 	default:
 		screen.HideCursor()
+	}
+}
+
+func (a *App) editorEvent(ev *tcell.EventKey) {
+	defer a.syncCursor()
+	defer a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
+	switch ev.Key() {
+	case tcell.KeyRune:
+		line := a.data.line(a.data.row)
+		if line == nil {
+			line = LineBuf("")
+			a.data.lines.PushBack(line)
+		}
+		line.insert(ev.Rune())
+		a.data.col = line.seek(a.data.col + 1)
+		a.editor[a.data.row-a.data.scroll].draw(line.String())
+	case tcell.KeyEnter:
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		// delete current line and move up
+		if a.data.col == 0 {
+			if a.data.row == 0 {
+				return // no line to delete
+			}
+			l := a.data.lines.Front()
+			for range a.data.row {
+				l = l.Next()
+			}
+			currentLine := l
+			prevLine := currentLine.Prev().Value.(*lineBuf)
+			a.data.lines.Remove(currentLine)
+			prevLine.line = append(prevLine.line,
+				currentLine.Value.(*lineBuf).line...)
+			a.data.col = prevLine.seek(len(prevLine.line))
+			a.data.row--
+			a.drawEditor()
+			return
+		}
+
+		line := a.data.line(a.data.row)
+		if line == nil {
+			return
+		}
+		line.backspace()
+		a.data.col = line.seek(a.data.col - 1)
+		a.editor[a.data.row-a.data.scroll].draw(line.String())
+	case tcell.KeyLeft:
+		line := a.data.line(a.data.row)
+		if line == nil {
+			return
+		}
+		a.data.col = line.seek(a.data.col - 1)
+	case tcell.KeyRight:
+		line := a.data.line(a.data.row)
+		if line == nil {
+			return
+		}
+		a.data.col = line.seek(a.data.col + 1)
+	case tcell.KeyUp:
+	case tcell.KeyDown:
 	}
 }
