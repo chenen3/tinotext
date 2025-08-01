@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -25,7 +26,6 @@ type App struct {
 	status  View
 	console View
 	cmdCh   chan string
-	focus   int
 	done    chan struct{}
 }
 
@@ -34,17 +34,22 @@ type Model struct {
 	tabs   []string
 	tabIdx int
 
-	lines  *list.List
-	row    int // start from 0
-	col    int // start from 0
-	scroll int // Scroll position for the editor
+	lines     *list.List
+	row       int // start from 0
+	col       int // start from 0
+	scroll    int // Scroll position for the editor
+	upDownCol int // ideal column when moving up/down
 
-	status  string
-	console *lineBuf
+	status string
+
+	console       string
+	consoleCursor int
+
+	focus int
 }
 
 // line return the lineBuf in list
-func (m *Model) line(i int) *lineBuf {
+func (m *Model) line(i int) *list.Element {
 	if m.lines.Len() == 0 || i > m.lines.Len()-1 {
 		return nil
 	}
@@ -53,7 +58,7 @@ func (m *Model) line(i int) *lineBuf {
 	for range i {
 		l = l.Next()
 	}
-	return l.Value.(*lineBuf)
+	return l
 }
 
 func (m *Model) openTab(s string) error {
@@ -93,32 +98,32 @@ func (m *Model) deleteTab(s string) {
 }
 
 type lineBuf struct {
-	line   []rune
+	buf    []rune
 	cursor int
 }
 
 func LineBuf(s string) *lineBuf {
 	return &lineBuf{
-		line:   []rune(s),
+		buf:    []rune(s),
 		cursor: len(s),
 	}
 }
 
 func (l *lineBuf) String() string {
-	return string(l.line)
+	return string(l.buf)
 }
 
 func (l *lineBuf) set(s string) {
-	l.line = []rune(s)
-	l.cursor = len(l.line)
+	l.buf = []rune(s)
+	l.cursor = len(l.buf)
 }
 
 // insert at inner cursor
 func (l *lineBuf) insert(r rune) {
-	if l.cursor >= len(l.line) {
-		l.line = append(l.line, r)
+	if l.cursor >= len(l.buf) {
+		l.buf = append(l.buf, r)
 	} else {
-		l.line = slices.Insert(l.line, l.cursor, r)
+		l.buf = slices.Insert(l.buf, l.cursor, r)
 	}
 	l.cursor++
 }
@@ -128,13 +133,13 @@ func (l *lineBuf) backspace() {
 	if l.cursor == 0 {
 		return
 	}
-	l.line = slices.Delete(l.line, l.cursor-1, l.cursor)
+	l.buf = slices.Delete(l.buf, l.cursor-1, l.cursor)
 	l.cursor--
 }
 
 // Move the cursor to the right, if possible.
 func (l *lineBuf) right() {
-	if l.cursor < len(l.line) {
+	if l.cursor < len(l.buf) {
 		l.cursor++
 	}
 }
@@ -151,9 +156,9 @@ func (l *lineBuf) left() {
 func (l *lineBuf) seek(i int) int {
 	if i < 0 {
 		i = 0
-	} else if i > len(l.line)-1 {
+	} else if i > len(l.buf)-1 {
 		// line end
-		i = len(l.line)
+		i = len(l.buf)
 	}
 	l.cursor = i
 	return i
@@ -165,8 +170,8 @@ type View struct {
 }
 
 func (v *View) draw(line ...string) {
-	for row := 0; row < v.h; row++ {
-		for col := 0; col < v.w; col++ {
+	for row := range v.h {
+		for col := range v.w {
 			if row < len(line) && col < len(line[row]) {
 				screen.SetContent(v.x+col, v.y+row, rune(line[row][col]), nil, v.style)
 			} else {
@@ -192,11 +197,13 @@ func (a *App) resize(width, height int) {
 
 const tabCloser = " x|"
 
+// draw the whole layout and cursor
 func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
-	a.status.draw(a.data.status)
-	a.console.draw("> " + string(a.data.console.line))
+	a.status.draw(fmt.Sprintf("Line %d, Column %d", a.data.row+1, a.data.col+1))
+	a.console.draw(a.data.console)
+	a.syncCursor()
 }
 
 func (a *App) drawTabs() {
@@ -286,14 +293,13 @@ func main() {
 
 	app := &App{
 		data: &Model{
-			lines:   list.New(),
-			status:  "Ready",
-			console: LineBuf("Type a command here..."),
+			lines:  list.New(),
+			status: "Ready",
 		},
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
 	}
-	go app.handleCommand()
+	go app.commandLoop()
 
 	// Event loop
 	for {
@@ -309,19 +315,36 @@ func main() {
 			s.Sync()
 		case *tcell.EventKey:
 			log.Printf("Key pressed: %s %c", tcell.KeyNames[ev.Key()], ev.Rune())
-			if ev.Key() == tcell.KeyEscape || ev.Key() == tcell.KeyCtrlC {
+			if ev.Key() == tcell.KeyCtrlC {
 				close(app.done)
 				s.Fini()
 				return
 			}
+			// redraw the screen, sometimes iTerm2 resize but doesn't trigger a resize event
+			if ev.Key() == tcell.KeyCtrlL {
+				s.Sync()
+				continue
+			}
+			// close current tab
+			if ev.Key() == tcell.KeyCtrlW {
+				if len(app.data.tabs) == 0 {
+					close(app.done)
+					s.Fini()
+					return
+				}
+				app.cmdCh <- ">close " + app.data.tabs[app.data.tabIdx]
+				continue
+			}
+			// open file
 			if ev.Key() == tcell.KeyCtrlP {
-				app.focus = focusConsole
+				app.data.focus = focusConsole
+				app.setStatus("open file by name (append : to go to line or > to execute command)")
 				app.setConsole("")
 				app.syncCursor()
 				continue
 			}
 
-			if app.focus == focusConsole {
+			if app.data.focus == focusConsole {
 				app.consoleEvent(ev)
 				app.syncCursor()
 				continue
@@ -354,7 +377,7 @@ func main() {
 }
 
 // A multiplier to be used on scrolling
-const scrollFactor = 0.125
+const scrollFactor = 0.1
 
 func (a *App) handleClick(x, y int) {
 	if a.tab.contains(x, y) {
@@ -362,11 +385,11 @@ func (a *App) handleClick(x, y int) {
 		for i, tab := range a.data.tabs {
 			if x < a.tab.x+width+len(tab) {
 				if i != a.data.tabIdx {
-					a.cmdCh <- "open " + tab
+					a.cmdCh <- tab
 				}
 				return
 			} else if x < a.tab.x+width+len(tab)+len(tabCloser) {
-				a.cmdCh <- "close " + tab
+				a.cmdCh <- ">close " + tab
 				return
 			}
 			width += len(tab) + len(tabCloser)
@@ -375,28 +398,30 @@ func (a *App) handleClick(x, y int) {
 	}
 
 	if a.console.contains(x, y) {
-		a.focus = focusConsole
+		a.data.focus = focusConsole
 		a.setConsole("")
 		a.syncCursor()
 		return
 	}
 
-	a.focus = focusEditor
+	a.data.focus = focusEditor
 	if a.data.lines.Len() == 0 {
 		a.data.row = 0
 		a.data.col = 0
 	} else {
-		row := y - a.editor[0].y + a.data.scroll
-		if row > a.data.lines.Len()-1 {
-			row = a.data.lines.Len() - 1
-		}
-		a.data.row = row
-		line := a.data.line(a.data.row)
+		a.data.row = min(y-a.editor[0].y+a.data.scroll, a.data.lines.Len()-1)
+		line := a.data.line(a.data.row).Value.(*lineBuf)
 		col := x - a.editor[0].x
 		a.data.col = line.seek(col)
 	}
-	a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
+	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.data.row+1, a.data.col+1))
 	a.syncCursor()
+	a.data.upDownCol = -1
+	// debug
+	if line := a.data.line(a.data.row); line != nil {
+		log.Printf("Clicked line %d, column %d, text: %q", a.data.row+1, a.data.col+1,
+			line.Value.(*lineBuf))
+	}
 }
 
 // setStatus updates the status view with the given string.
@@ -407,100 +432,137 @@ func (a *App) setStatus(s string) {
 
 // setConsole updates the console view with the given string.
 func (a *App) setConsole(s string) {
-	a.data.console.set(s)
-	a.console.draw("> " + s)
+	a.data.console = s
+	a.data.consoleCursor = len(s)
+	a.console.draw(s)
 }
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	switch ev.Key() {
+	case tcell.KeyEscape:
+		a.data.console = ""
+		a.data.consoleCursor = 0
+		a.data.focus = focusEditor
+		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.data.row+1, a.data.col+1))
 	case tcell.KeyEnter:
-		if len(a.data.console.line) > 0 {
-			a.cmdCh <- string(a.data.console.line)
-			a.data.console.set("")
+		if a.data.console != "" {
+			a.cmdCh <- strings.TrimSpace(a.data.console)
+			a.data.console = ""
+			a.data.consoleCursor = 0
 		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if len(a.data.console.line) > 0 {
-			a.data.console.backspace()
+		if a.data.console == "" {
+			return
 		}
+		a.data.console = a.data.console[:len(a.data.console)-1]
+		a.data.consoleCursor--
 	case tcell.KeyLeft:
-		a.data.console.left()
-	case tcell.KeyRight:
-		a.data.console.right()
-	default:
-		if ev.Rune() != 0 {
-			a.data.console.insert(ev.Rune())
+		if a.data.console == "" {
+			return
 		}
+		a.data.consoleCursor--
+	case tcell.KeyRight:
+		if a.data.console == "" || a.data.consoleCursor >= len(a.data.console) {
+			return
+		}
+		a.data.consoleCursor++
+	case tcell.KeyRune:
+		if a.data.consoleCursor >= len(a.data.console) {
+			a.data.console += string(ev.Rune())
+		} else {
+			a.data.console = a.data.console[:a.data.consoleCursor] + string(ev.Rune()) + a.data.console[a.data.consoleCursor:]
+		}
+		a.data.consoleCursor++
+	default:
+		return
 	}
-	a.console.draw("> " + string(a.data.console.line))
+	a.console.draw(a.data.console)
 }
 
-/*
->open file
->close tab
->find word
-:line
-@symbol
-*/
-func (a *App) handleCommand() {
+// form of command:
+// filename
+// :line
+// >close tab
+//
+// TODO:
+// >find word
+// @symbol
+func (a *App) handleCommand(cmd string) {
+	// this function is called out of the main goroutine,
+	// content changes here may not be visible in time,
+	// so make sure to call screen.Show() after making changes
+	defer screen.Show()
+	switch cmd[0] {
+	case '>':
+		c := strings.Split(cmd[1:], " ")
+		switch c[0] {
+		case "close":
+			if len(c) == 1 {
+				a.setStatus("Usage: close <filename>")
+				return
+			}
+			filename := c[1]
+			currentTab := a.data.tabs[a.data.tabIdx]
+			a.data.deleteTab(filename)
+			// no tab left
+			if len(a.data.tabs) == 0 {
+				a.data.lines.Init()
+				a.data.row = 0
+				a.data.col = 0
+				a.draw()
+				return
+			}
+			// closed other tab
+			if filename != currentTab {
+				a.drawTabs()
+				return
+			}
+			// switch to next tab
+			err := a.data.openTab(a.data.tabs[a.data.tabIdx])
+			if err != nil {
+				a.setStatus(err.Error())
+				return
+			}
+			a.draw()
+		default:
+			a.setStatus("unknown command: " + cmd)
+		}
+	case ':':
+		line, err := strconv.Atoi(cmd[1:])
+		if err != nil {
+			a.setStatus("Invalid line number")
+			return
+		}
+		if line < 1 || line > a.data.lines.Len() {
+			a.setStatus("Line number out of range")
+			return
+		}
+		a.data.row = line - 1
+		a.data.col = 0
+		a.data.scroll = line - 1
+		a.data.focus = focusEditor
+		a.draw()
+	case '@':
+	default:
+		filename := cmd
+		err := a.data.openTab(filename)
+		if err != nil {
+			a.setStatus(err.Error())
+			screen.Show()
+			return
+		}
+
+		a.data.focus = focusEditor
+		a.draw()
+	}
+}
+
+func (a *App) commandLoop() {
 	for {
 		select {
 		case cmd := <-a.cmdCh:
 			log.Println("Command received:", cmd)
-			c := strings.Split(strings.TrimSpace(cmd), " ")
-			switch c[0] {
-			case "open":
-				if len(c) == 1 {
-					a.setStatus("Usage: open <filename>")
-					continue
-				}
-
-				filename := c[1]
-				err := a.data.openTab(filename)
-				if err != nil {
-					log.Println(err)
-					a.setStatus(err.Error())
-					screen.Show()
-					continue
-				}
-
-				a.focus = focusEditor
-				a.draw()
-				a.syncCursor()
-				screen.Show()
-			case "close":
-				if len(c) == 1 {
-					a.setStatus("Usage: close <filename>")
-					continue
-				}
-				filename := c[1]
-				currentTab := a.data.tabs[a.data.tabIdx]
-				a.data.deleteTab(filename)
-				if filename != currentTab {
-					// closed other tab, just redraw
-					a.drawTabs()
-					continue
-				}
-				if len(a.data.tabs) == 0 {
-					a.data.lines.Init()
-					a.draw()
-					screen.Show()
-					continue
-				}
-				bs, err := os.ReadFile(a.data.tabs[a.data.tabIdx])
-				if err != nil {
-					log.Println(err)
-					continue
-				}
-				a.data.lines.Init()
-				for _, line := range bytes.Split(bs, []byte{'\n'}) {
-					a.data.lines.PushBack(LineBuf(string(line)))
-				}
-				a.draw()
-				screen.Show()
-			default:
-				a.setStatus("unknown command: " + cmd)
-				screen.Show()
-			}
+			a.handleCommand(cmd)
 		case <-a.done:
 			return
 		}
@@ -508,7 +570,7 @@ func (a *App) handleCommand() {
 }
 
 func (a *App) syncCursor() {
-	switch a.focus {
+	switch a.data.focus {
 	case focusEditor:
 		if a.data.row < a.data.scroll || a.data.row > (a.data.scroll+len(a.editor)-1) {
 			// out of viewport
@@ -517,35 +579,52 @@ func (a *App) syncCursor() {
 		}
 		screen.ShowCursor(a.editor[0].x+a.data.col, a.editor[0].y+a.data.row-a.data.scroll)
 	case focusConsole:
-		screen.ShowCursor(a.console.x+2+a.data.console.cursor, a.console.y)
+		screen.ShowCursor(a.console.x+a.data.consoleCursor, a.console.y)
 	default:
 		screen.HideCursor()
 	}
 }
 
-// TODO
-var prevKey tcell.Key
-var prevCol int
-
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
-		a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
-		prevKey = ev.Key()
+		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.data.row+1, a.data.col+1))
+		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
+			a.data.upDownCol = -1
+		}
 	}()
 	switch ev.Key() {
 	case tcell.KeyRune:
-		line := a.data.line(a.data.row)
-		if line == nil {
+		var line *lineBuf
+		if e := a.data.line(a.data.row); e == nil {
 			line = LineBuf("")
 			a.data.lines.PushBack(line)
+		} else {
+			line = e.Value.(*lineBuf)
 		}
 		line.insert(ev.Rune())
 		a.data.col = line.seek(a.data.col + 1)
 		a.editor[a.data.row-a.data.scroll].draw(line.String())
 	case tcell.KeyEnter:
+		if e := a.data.line(a.data.row); e == nil {
+			// file end
+			line := LineBuf("")
+			a.data.lines.PushBack(line)
+		} else {
+			line := e.Value.(*lineBuf)
+			buf := make([]rune, len(line.buf)-a.data.col)
+			copy(buf, line.buf[a.data.col:])
+			a.data.lines.InsertAfter(&lineBuf{buf: buf}, e)
+			line.buf = line.buf[:a.data.col]
+		}
+		a.data.col = 0
+		a.data.row++
+		if a.data.row >= a.data.scroll+len(a.editor) {
+			a.data.scroll++
+		}
+		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		// delete current line and move up
+		// backspace at line start, delete current line and move up
 		if a.data.col == 0 {
 			if a.data.row == 0 {
 				return // no line to delete
@@ -556,16 +635,16 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			}
 			currentLine := l
 			prevLine := currentLine.Prev().Value.(*lineBuf)
+			a.data.col = prevLine.seek(len(prevLine.buf))
 			a.data.lines.Remove(currentLine)
-			prevLine.line = append(prevLine.line,
-				currentLine.Value.(*lineBuf).line...)
-			a.data.col = prevLine.seek(len(prevLine.line))
+			prevLine.buf = append(prevLine.buf,
+				currentLine.Value.(*lineBuf).buf...)
 			a.data.row--
 			a.drawEditor()
 			return
 		}
 
-		line := a.data.line(a.data.row)
+		line := a.data.line(a.data.row).Value.(*lineBuf)
 		if line == nil {
 			return
 		}
@@ -573,31 +652,61 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.data.col = line.seek(a.data.col - 1)
 		a.editor[a.data.row-a.data.scroll].draw(line.String())
 	case tcell.KeyLeft:
-		line := a.data.line(a.data.row)
-		if line == nil {
+		// file start
+		if a.data.row == 0 && a.data.col == 0 {
 			return
 		}
+		if a.data.col == 0 {
+			// move to previous line
+			a.data.row--
+			line := a.data.line(a.data.row).Value.(*lineBuf)
+			a.data.col = line.seek(len(line.buf))
+			if a.data.row < a.data.scroll {
+				a.data.scroll--
+				a.drawEditor()
+			}
+			return
+		}
+		line := a.data.line(a.data.row).Value.(*lineBuf)
 		a.data.col = line.seek(a.data.col - 1)
 	case tcell.KeyRight:
-		line := a.data.line(a.data.row)
-		if line == nil {
+		lineItem := a.data.line(a.data.row)
+		if lineItem == nil {
 			return
 		}
-		a.data.col = line.seek(a.data.col + 1)
+
+		line := lineItem.Value.(*lineBuf)
+		// middle of the line
+		if a.data.col < len(line.buf) {
+			a.data.col = line.seek(a.data.col + 1)
+			return
+		}
+		// file end
+		if lineItem.Next() == nil {
+			return
+		}
+		// line end, move to next line
+		a.data.row++
+		a.data.col = 0
+		if a.data.row >= a.data.scroll+len(a.editor) {
+			a.data.scroll++
+			a.drawEditor()
+		}
 	case tcell.KeyUp:
 		if a.data.row == 0 {
 			return // already at the top
 		}
 
 		a.data.row--
-		line := a.data.line(a.data.row)
+		line := a.data.line(a.data.row).Value.(*lineBuf)
 		if line == nil {
 			a.data.col = 0
-		} else if prevKey == tcell.KeyUp {
-			// if the previous key was also up, keep previous column
-			a.data.col = line.seek(prevCol)
+		} else if a.data.upDownCol > 0 {
+			// moving up/down, keep previous column
+			a.data.col = line.seek(a.data.upDownCol)
 		} else {
-			// keep current column
+			// start moving up/down, keep current column
+			a.data.upDownCol = a.data.col
 			a.data.col = line.seek(a.data.col)
 		}
 		if a.data.row < a.data.scroll {
@@ -606,5 +715,35 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 	case tcell.KeyDown:
+		if a.data.row == a.data.lines.Len()-1 {
+			return // already at the bottom
+		}
+
+		a.data.row++
+		line := a.data.line(a.data.row).Value.(*lineBuf)
+		if line == nil {
+			a.data.col = 0
+		} else if a.data.upDownCol > 0 {
+			// moving up/down, keep previous column
+			a.data.col = line.seek(a.data.upDownCol)
+		} else {
+			// start moving up/down, keep current column
+			a.data.upDownCol = a.data.col
+			a.data.col = line.seek(a.data.col)
+		}
+		if a.data.row >= a.data.scroll+len(a.editor) {
+			a.data.scroll++
+			a.drawEditor()
+			return
+		}
+	case tcell.KeyCtrlA:
+		a.data.col = 0
+	case tcell.KeyCtrlE:
+		e := a.data.line(a.data.row)
+		if e == nil {
+			return
+		}
+		line := e.Value.(*lineBuf)
+		a.data.col = line.seek(len(line.buf))
 	}
 }
