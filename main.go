@@ -523,9 +523,16 @@ func (a *App) syncCursor() {
 	}
 }
 
+// TODO
+var prevKey tcell.Key
+var prevCol int
+
 func (a *App) editorEvent(ev *tcell.EventKey) {
-	defer a.syncCursor()
-	defer a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
+	defer func() {
+		a.syncCursor()
+		a.setStatus(fmt.Sprintf("Row %d, Column %d", a.data.row+1, a.data.col+1))
+		prevKey = ev.Key()
+	}()
 	switch ev.Key() {
 	case tcell.KeyRune:
 		line := a.data.line(a.data.row)
@@ -578,6 +585,26 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.data.col = line.seek(a.data.col + 1)
 	case tcell.KeyUp:
+		if a.data.row == 0 {
+			return // already at the top
+		}
+
+		a.data.row--
+		line := a.data.line(a.data.row)
+		if line == nil {
+			a.data.col = 0
+		} else if prevKey == tcell.KeyUp {
+			// if the previous key was also up, keep previous column
+			a.data.col = line.seek(prevCol)
+		} else {
+			// keep current column
+			a.data.col = line.seek(a.data.col)
+		}
+		if a.data.row < a.data.scroll {
+			a.data.scroll--
+			a.drawEditor()
+			return
+		}
 	case tcell.KeyDown:
 	}
 }
