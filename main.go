@@ -33,14 +33,15 @@ type State struct {
 	tabs          []string
 	tabIdx        int
 	lines         *list.List
-	row           int    // Current row position (starts from 0)
-	col           int    // Current column position (starts from 0)
-	scroll        int    // Scroll position for the editor (starts from 0)
-	upDownCol     int    // Column to maintain while navigating up/down
-	status        string // Status message displayed in the status bar
-	console       string // Console input text
-	consoleCursor int    // Cursor position in the console
-	focus         int    // Current focus (editor or console)
+	row           int                 // Current row position (starts from 0)
+	col           int                 // Current column position (starts from 0)
+	scroll        int                 // Scroll position for the editor (starts from 0)
+	upDownCol     int                 // Column to maintain while navigating up/down
+	status        string              // Status message displayed in the status bar
+	console       string              // Console input text
+	consoleCursor int                 // Cursor position in the console
+	focus         int                 // Current focus (editor or console)
+	symbols       map[string][]Symbol // symbol name to list of symbols
 }
 
 // line return the lineBuf in list
@@ -77,6 +78,16 @@ func (st *State) openTab(s string) error {
 	st.scroll = 0
 	st.row = 0
 	st.col = 0
+
+	if !strings.HasSuffix(s, ".go") {
+		st.symbols = nil
+		return nil
+	}
+	symbols, err := ParseSymbol(s)
+	if err != nil {
+		return err
+	}
+	st.symbols = symbols
 	return nil
 }
 
@@ -119,6 +130,30 @@ func (v *View) draw(line ...string) {
 	}
 }
 
+type textStyle struct {
+	text  string
+	style tcell.Style
+}
+
+// draw inline texts
+func (v *View) drawText(texts ...textStyle) {
+	var col int
+	for _, ts := range texts {
+		style := ts.style
+		if style == tcell.StyleDefault {
+			style = v.style
+		}
+		for _, c := range ts.text {
+			screen.SetContent(v.x+col, v.y, c, nil, style)
+			col++
+		}
+	}
+	// clear remaining space
+	for i := col; i < v.w; i++ {
+		screen.SetContent(v.x+i, v.y, ' ', nil, v.style)
+	}
+}
+
 func (v *View) contains(x, y int) bool {
 	return x >= v.x && x < v.x+v.w && y >= v.y && y < v.y+v.h
 }
@@ -144,30 +179,26 @@ func (a *App) draw() {
 	a.syncCursor()
 }
 
+// paper-like yellow color
+// style = style.Foreground(tcell.NewRGBColor(255, 249, 202))
+
 func (a *App) drawTabs() {
 	if len(a.s.tabs) == 0 {
 		a.tab.draw("New Tab")
 		return
 	}
 
-	var col int
+	var ts []textStyle
 	for i, tab := range a.s.tabs {
-		style := a.tab.style.Background(tcell.ColorDarkGray)
 		if i == a.s.tabIdx {
-			style = a.tab.style.Bold(true)
-			// paper-like yellow color
-			// style = style.Foreground(tcell.NewRGBColor(255, 249, 202))
-		}
-		for _, c := range tab + tabCloser {
-			screen.SetContent(a.tab.x+col, a.tab.y, c, nil, style)
-			col++
+			ts = append(ts, textStyle{text: tab, style: a.tab.style.Bold(true).Underline(true).Italic(true)})
+			ts = append(ts, textStyle{text: tabCloser, style: a.tab.style.Bold(true)})
+		} else {
+			ts = append(ts, textStyle{text: tab})
+			ts = append(ts, textStyle{text: tabCloser})
 		}
 	}
-
-	// clear remaining space
-	for i := col; i < a.tab.w; i++ {
-		screen.SetContent(a.tab.x+i, a.tab.y, ' ', nil, a.tab.style)
-	}
+	a.tab.drawText(ts...)
 }
 
 func (a *App) drawEditor() {
@@ -253,7 +284,7 @@ func main() {
 			s.Sync()
 		case *tcell.EventKey:
 			log.Printf("Key pressed: %s %c", tcell.KeyNames[ev.Key()], ev.Rune())
-			if ev.Key() == tcell.KeyCtrlC {
+			if ev.Key() == tcell.KeyCtrlQ {
 				close(app.done)
 				s.Fini()
 				return
@@ -274,10 +305,34 @@ func main() {
 				continue
 			}
 			// open file
+			if ev.Key() == tcell.KeyCtrlO {
+				app.s.focus = focusConsole
+				app.setStatus("open file by name (:<line> or @symbol)")
+				app.setConsole("")
+				app.syncCursor()
+				continue
+			}
+			// go to line
+			if ev.Key() == tcell.KeyCtrlG {
+				app.s.focus = focusConsole
+				app.setStatus("type a line number to go to")
+				app.setConsole(":")
+				app.syncCursor()
+				continue
+			}
+			// go to symbol
+			if ev.Key() == tcell.KeyCtrlR {
+				app.s.focus = focusConsole
+				app.setStatus("type a symbol name to go to")
+				app.setConsole("@")
+				app.syncCursor()
+				continue
+			}
+			// command
 			if ev.Key() == tcell.KeyCtrlP {
 				app.s.focus = focusConsole
-				app.setStatus("open file by name (append : to go to line or > to execute command)")
-				app.setConsole("")
+				app.setStatus("command:")
+				app.setConsole(">")
 				app.syncCursor()
 				continue
 			}
@@ -323,6 +378,7 @@ func (a *App) handleClick(x, y int) {
 		for i, tab := range a.s.tabs {
 			if x < a.tab.x+width+len(tab) {
 				if i != a.s.tabIdx {
+					// switch tab, open the file
 					a.cmdCh <- tab
 				}
 				return
@@ -420,11 +476,11 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 // form of command:
 // filename
 // :line
-// >close tab
+// @symbol
+// >close filename
 //
 // TODO:
 // >find word
-// @symbol
 func (a *App) handleCommand(cmd string) {
 	// this function is called out of the main goroutine,
 	// content changes here may not be visible in time,
@@ -435,11 +491,15 @@ func (a *App) handleCommand(cmd string) {
 		c := strings.Split(cmd[1:], " ")
 		switch c[0] {
 		case "close":
-			if len(c) == 1 {
+			if len(c) == 1 || len(c[1]) == 0 {
 				a.setStatus("Usage: close <filename>")
 				return
 			}
 			filename := c[1]
+			if !slices.Contains(a.s.tabs, filename) {
+				a.setStatus("Tab not found: " + filename)
+				return
+			}
 			currentTab := a.s.tabs[a.s.tabIdx]
 			a.s.deleteTab(filename)
 			// no tab left
@@ -466,6 +526,7 @@ func (a *App) handleCommand(cmd string) {
 			a.setStatus("unknown command: " + cmd)
 		}
 	case ':':
+		// go to line
 		line, err := strconv.Atoi(cmd[1:])
 		if err != nil {
 			a.setStatus("Invalid line number")
@@ -477,11 +538,29 @@ func (a *App) handleCommand(cmd string) {
 		}
 		a.s.row = line - 1
 		a.s.col = 0
-		a.s.scroll = line - 1
+		a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
 		a.s.focus = focusEditor
 		a.draw()
 	case '@':
+		// go to symbol
+		symbolStr := cmd[1:]
+		if symbolStr == "" {
+			a.setStatus("Usage: @symbol")
+			return
+		}
+		symbols, ok := a.s.symbols[symbolStr]
+		if !ok {
+			log.Printf("Symbol not found: %s", symbolStr)
+			return
+		}
+		// TODO: could be multiple symbols with the same name
+		a.s.row = symbols[0].Line - 1
+		a.s.col = symbols[0].Column - 1
+		a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
+		a.s.focus = focusEditor
+		a.draw()
 	default:
+		// open file
 		filename := cmd
 		err := a.s.openTab(filename)
 		if err != nil {
@@ -543,6 +622,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			e.Value = line
 		}
 		a.s.col++
+		// if a.s.col == len(line) {
+		// 	// line end, see if there is a completion
+		// 	var completion string
+		// 	if completion != "" {
+		// 		line = line[:a.s.col] + completion
+		// 	}
+		// }
 		a.editor[a.s.row-a.s.scroll].draw(line)
 	case tcell.KeyEnter:
 		if e := a.s.line(a.s.row); e == nil {
@@ -577,11 +663,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		// line := a.s.line(a.s.row).Value.(*lineBuf)
-		// if line == nil {
-		// 	return
-		// }
-		// line.buf = slices.Delete(line.buf, a.s.col-1, a.s.col)
 		line := a.s.line(a.s.row)
 		text := line.Value.(string)
 		text = text[:a.s.col-1] + text[a.s.col:]
