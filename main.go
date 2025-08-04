@@ -81,11 +81,7 @@ func (st *State) openTab(s string) error {
 	st.scroll = 0
 	st.row = 0
 	st.col = 0
-
-	if !strings.HasSuffix(s, ".go") {
-		st.symbols = nil
-		return nil
-	}
+	st.symbols = nil
 	return nil
 }
 
@@ -211,7 +207,7 @@ func (a *App) drawEditor() {
 		if i < remainlines {
 			// highlight the current line
 			if a.s.row == a.s.scroll+i {
-				lineView.style = lineView.style.Reverse(true)
+				lineView.style = lineView.style.Reverse(true).Foreground(paperColor)
 			} else {
 				lineView.style = tcell.StyleDefault
 			}
@@ -267,14 +263,23 @@ func main() {
 	defer quit()
 
 	app := &App{
-		s: &State{
-			lines:  list.New(),
-			status: "Ready",
-		},
+		s:     &State{lines: list.New()},
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
 	}
 	go app.commandLoop()
+
+	if len(os.Args) >= 2 {
+		bs, err := os.ReadFile(os.Args[1])
+		if err != nil {
+			log.Print(err)
+		} else {
+			app.s.tabs = []string{os.Args[1]}
+			for _, line := range bytes.Split(bs, []byte{'\n'}) {
+				app.s.lines.PushBack(string(line))
+			}
+		}
+	}
 
 	// Event loop
 	for {
