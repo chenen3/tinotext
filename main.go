@@ -33,15 +33,18 @@ type State struct {
 	tabs          []string
 	tabIdx        int
 	lines         *list.List
-	row           int                 // Current row position (starts from 0)
-	col           int                 // Current column position (starts from 0)
-	scroll        int                 // Scroll position for the editor (starts from 0)
-	upDownCol     int                 // Column to maintain while navigating up/down
-	status        string              // Status message displayed in the status bar
-	console       string              // Console input text
-	consoleCursor int                 // Cursor position in the console
-	focus         int                 // Current focus (editor or console)
-	symbols       map[string][]Symbol // symbol name to list of symbols
+	row           int               // Current row position (starts from 0)
+	col           int               // Current column position (starts from 0)
+	scroll        int               // Scroll position for the editor (starts from 0)
+	upDownCol     int               // Column to maintain while navigating up/down
+	status        string            // Status message displayed in the status bar
+	console       string            // Console input text
+	consoleCursor int               // Cursor position in the console
+	focus         int               // Current focus (editor or console)
+	symbols       map[string]Symbol // symbol name to list of symbols
+	matchSymbols  []Symbol
+	matchIdx      int
+	completion    string
 }
 
 // line return the lineBuf in list
@@ -83,11 +86,6 @@ func (st *State) openTab(s string) error {
 		st.symbols = nil
 		return nil
 	}
-	symbols, err := ParseSymbol(s)
-	if err != nil {
-		return err
-	}
-	st.symbols = symbols
 	return nil
 }
 
@@ -118,13 +116,18 @@ type View struct {
 	style      tcell.Style
 }
 
-func (v *View) draw(line ...string) {
+// draw a line with a optional style
+func (v *View) draw(line string, style ...tcell.Style) {
+	s := v.style
+	if len(style) > 0 {
+		s = style[0]
+	}
 	for row := range v.h {
 		for col := range v.w {
-			if row < len(line) && col < len(line[row]) {
-				screen.SetContent(v.x+col, v.y+row, rune(line[row][col]), nil, v.style)
+			if col < len(line) {
+				screen.SetContent(v.x+col, v.y+row, rune(line[col]), nil, s)
 			} else {
-				screen.SetContent(v.x+col, v.y+row, ' ', nil, v.style)
+				screen.SetContent(v.x+col, v.y+row, ' ', nil, s)
 			}
 		}
 	}
@@ -135,7 +138,7 @@ type textStyle struct {
 	style tcell.Style
 }
 
-// draw inline texts
+// draw inline texts with different styles
 func (v *View) drawText(texts ...textStyle) {
 	var col int
 	for _, ts := range texts {
@@ -179,9 +182,6 @@ func (a *App) draw() {
 	a.syncCursor()
 }
 
-// paper-like yellow color
-// style = style.Foreground(tcell.NewRGBColor(255, 249, 202))
-
 func (a *App) drawTabs() {
 	if len(a.s.tabs) == 0 {
 		a.tab.draw("New Tab")
@@ -209,6 +209,12 @@ func (a *App) drawEditor() {
 	remainlines := a.s.lines.Len() - a.s.scroll
 	for i, lineView := range a.editor {
 		if i < remainlines {
+			// highlight the current line
+			if a.s.row == a.s.scroll+i {
+				lineView.style = lineView.style.Reverse(true)
+			} else {
+				lineView.style = tcell.StyleDefault
+			}
 			lineView.draw(line.Value.(string))
 			line = line.Next()
 		} else {
@@ -294,7 +300,6 @@ func main() {
 				s.Sync()
 				continue
 			}
-			// close current tab
 			if ev.Key() == tcell.KeyCtrlW {
 				if len(app.s.tabs) == 0 {
 					close(app.done)
@@ -304,31 +309,51 @@ func main() {
 				app.cmdCh <- ">close " + app.s.tabs[app.s.tabIdx]
 				continue
 			}
-			// open file
 			if ev.Key() == tcell.KeyCtrlO {
 				app.s.focus = focusConsole
-				app.setStatus("open file by name (:<line> or @symbol)")
+				app.setStatus("open file (:<line> or @symbol)")
 				app.setConsole("")
 				app.syncCursor()
 				continue
 			}
-			// go to line
 			if ev.Key() == tcell.KeyCtrlG {
 				app.s.focus = focusConsole
-				app.setStatus("type a line number to go to")
+				app.setStatus("go to line number")
 				app.setConsole(":")
 				app.syncCursor()
 				continue
 			}
-			// go to symbol
 			if ev.Key() == tcell.KeyCtrlR {
 				app.s.focus = focusConsole
-				app.setStatus("type a symbol name to go to")
+				app.setStatus("go to symbol")
 				app.setConsole("@")
+				app.syncCursor()
+
+				if len(app.s.tabs) == 0 {
+					app.setStatus("Not a Go file, cannot parse symbols")
+					continue
+				}
+				if !strings.HasSuffix(app.s.tabs[app.s.tabIdx], ".go") {
+					app.setStatus("Not a Go file, cannot parse symbols")
+					continue
+				}
+				symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx])
+				if err != nil {
+					app.setStatus("Failed to parse symbols: " + err.Error())
+					continue
+				}
+				app.s.symbols = symbols
+				app.s.matchSymbols = nil
+				app.s.matchIdx = 0
+				continue
+			}
+			if ev.Key() == tcell.KeyCtrlF {
+				app.s.focus = focusConsole
+				app.setStatus("search text")
+				app.setConsole("#")
 				app.syncCursor()
 				continue
 			}
-			// command
 			if ev.Key() == tcell.KeyCtrlP {
 				app.s.focus = focusConsole
 				app.setStatus("command:")
@@ -357,10 +382,15 @@ func main() {
 				app.drawEditor()
 				app.syncCursor()
 			case tcell.WheelDown:
+				// keep in viewport
+				if app.s.lines.Len() < len(app.editor) {
+					app.s.scroll = 0
+					continue
+				}
 				app.s.scroll += int(float32(y) * scrollFactor)
-				// keep it viewport
 				if app.s.scroll > app.s.lines.Len()-len(app.editor) {
 					app.s.scroll = app.s.lines.Len() - len(app.editor)
+					continue
 				}
 				app.drawEditor()
 				app.syncCursor()
@@ -408,9 +438,14 @@ func (a *App) handleClick(x, y int) {
 		col := x - a.editor[0].x
 		a.s.col = adjustIndex(line, col)
 	}
+
+	// highlight the clicked line
+	// TODO: not the effcient way to do this, but works for now
+	a.drawEditor()
+
 	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 	a.syncCursor()
-	a.s.upDownCol = -1
+	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
 	if line := a.s.line(a.s.row); line != nil {
 		log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
@@ -431,6 +466,16 @@ func (a *App) setConsole(s string) {
 	a.console.draw(s)
 }
 
+// jump moves the cursor to the specified line and column,
+// adjusting the scroll position to keep the line in view.
+// Note: it does not render the editor
+func (a *App) jump(row, col int) {
+	a.s.row = row
+	a.s.col = col
+	a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
+	a.s.focus = focusEditor
+}
+
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEscape:
@@ -439,17 +484,29 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.s.focus = focusEditor
 		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 	case tcell.KeyEnter:
-		if a.s.console != "" {
-			a.cmdCh <- strings.TrimSpace(a.s.console)
-			a.s.console = ""
-			a.s.consoleCursor = 0
+		if a.s.console == "" {
+			return
 		}
+		// go to symbol
+		if a.s.console[0] == '@' && len(a.s.matchSymbols) > 0 {
+			matched := a.s.matchSymbols[a.s.matchIdx]
+			a.jump(matched.Line-1, matched.Column-1)
+			a.s.console = ""
+			a.draw()
+			return
+		}
+		a.cmdCh <- strings.TrimSpace(a.s.console)
+		a.s.console = ""
+		a.s.consoleCursor = 0
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if a.s.console == "" {
 			return
 		}
 		a.s.console = a.s.console[:len(a.s.console)-1]
 		a.s.consoleCursor--
+		if a.s.console != "" && a.s.console[0] == '@' {
+			a.cmdCh <- a.s.console
+		}
 	case tcell.KeyLeft:
 		if a.s.console == "" {
 			return
@@ -467,24 +524,48 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			a.s.console = a.s.console[:a.s.consoleCursor] + string(ev.Rune()) + a.s.console[a.s.consoleCursor:]
 		}
 		a.s.consoleCursor++
+		// incremental command handling
+		if len(a.s.console) >= 2 && a.s.console[0] == '@' {
+			a.cmdCh <- a.s.console
+		}
+	case tcell.KeyTAB, tcell.KeyBacktab:
+		if len(a.s.matchSymbols) == 0 {
+			return
+		}
+		// select symbol in the match list
+		if ev.Key() == tcell.KeyTAB {
+			a.s.matchIdx = (a.s.matchIdx + 1) % len(a.s.matchSymbols)
+		} else {
+			a.s.matchIdx = (a.s.matchIdx - 1 + len(a.s.matchSymbols)) % len(a.s.matchSymbols)
+		}
+		ts := make([]textStyle, len(a.s.matchSymbols))
+		for i, sym := range a.s.matchSymbols {
+			if i == a.s.matchIdx {
+				ts[i] = textStyle{
+					text:  sym.Name + " ",
+					style: a.status.style.Bold(true).Foreground(paperColor),
+				}
+			} else {
+				ts[i] = textStyle{text: sym.Name + " "}
+			}
+		}
+		a.status.drawText(ts...)
 	default:
 		return
 	}
 	a.console.draw(a.s.console)
 }
 
-// form of command:
-// filename
-// :line
-// @symbol
-// >close filename
-//
-// TODO:
-// >find word
+// handleCommand processes a command string and performs actions based on its prefix.
+// Commands:
+// - <filename> open file
+// - :<line_number> go to line
+// - @<symbol> go to symbol
+// - #<text> search text
+// - >close <filename>
 func (a *App) handleCommand(cmd string) {
-	// this function is called out of the main goroutine,
-	// content changes here may not be visible in time,
-	// so make sure to call screen.Show() after making changes
+	// this function is called outside the main goroutine,
+	// so ensure to call screen.Show() after making changes to reflect updates.
 	defer screen.Show()
 	switch cmd[0] {
 	case '>':
@@ -526,7 +607,6 @@ func (a *App) handleCommand(cmd string) {
 			a.setStatus("unknown command: " + cmd)
 		}
 	case ':':
-		// go to line
 		line, err := strconv.Atoi(cmd[1:])
 		if err != nil {
 			a.setStatus("Invalid line number")
@@ -536,29 +616,87 @@ func (a *App) handleCommand(cmd string) {
 			a.setStatus("Line number out of range")
 			return
 		}
-		a.s.row = line - 1
-		a.s.col = 0
-		a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
-		a.s.focus = focusEditor
+		a.jump(line-1, 0)
 		a.draw()
 	case '@':
-		// go to symbol
 		symbolStr := cmd[1:]
 		if symbolStr == "" {
+			a.s.matchSymbols = nil
 			a.setStatus("Usage: @symbol")
 			return
 		}
-		symbols, ok := a.s.symbols[symbolStr]
-		if !ok {
-			log.Printf("Symbol not found: %s", symbolStr)
+		var matched []Symbol
+		for k, v := range a.s.symbols {
+			if strings.Contains(strings.ToLower(k), strings.ToLower(symbolStr)) {
+				matched = append(matched, v)
+			}
+		}
+		slices.SortFunc(matched, func(a, b Symbol) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		a.s.matchSymbols = matched
+		a.s.matchIdx = 0
+		if len(matched) == 0 {
+			a.setStatus("no matching symbols")
 			return
 		}
-		// TODO: could be multiple symbols with the same name
-		a.s.row = symbols[0].Line - 1
-		a.s.col = symbols[0].Column - 1
-		a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
-		a.s.focus = focusEditor
-		a.draw()
+		ts := make([]textStyle, len(matched))
+		for i, sym := range matched {
+			if i == a.s.matchIdx {
+				ts[i] = textStyle{
+					text:  sym.Name + " ",
+					style: a.status.style.Bold(true).Foreground(paperColor),
+				}
+			} else {
+				ts[i] = textStyle{text: sym.Name + " "}
+			}
+		}
+		a.status.drawText(ts...)
+	case '#':
+		text := cmd[1:]
+		if text == "" {
+			a.setStatus("Usage: #text")
+			return
+		}
+		row := a.s.row
+		col := a.s.col
+		var reverse bool
+		start := a.s.line(row)
+		for e := start; ; e = e.Next() {
+			if e == nil {
+				// reverse search
+				e = a.s.lines.Front()
+				row = 0
+				col = 0
+				reverse = true
+			}
+			if e == start && reverse {
+				// reached the start again, no match found
+				a.setStatus("Text not found")
+				a.setConsole(cmd)
+				a.syncCursor()
+				return
+			}
+			line := e.Value.(string)
+			if i := strings.Index(line[col:], text); i > -1 {
+				a.s.row = row
+				a.s.col = col + i + len(text)
+				a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
+				// incremental search
+				a.setConsole(cmd)
+				a.draw()
+				lineView := a.editor[a.s.row-a.s.scroll]
+				// highlight the found text
+				lineView.drawText(
+					textStyle{text: line[:col+i]},
+					textStyle{text: line[col+i : a.s.col], style: lineView.style.Reverse(true)},
+					textStyle{text: line[a.s.col:]},
+				)
+				return
+			}
+			row++
+			col = 0
+		}
 	default:
 		// open file
 		filename := cmd
@@ -578,13 +716,16 @@ func (a *App) commandLoop() {
 	for {
 		select {
 		case cmd := <-a.cmdCh:
-			log.Println("Command received:", cmd)
+			log.Printf("Command received: %q", cmd)
 			a.handleCommand(cmd)
 		case <-a.done:
 			return
 		}
 	}
 }
+
+// paper-like yellow color
+var paperColor = tcell.NewRGBColor(255, 249, 202)
 
 func (a *App) syncCursor() {
 	switch a.s.focus {
@@ -595,6 +736,7 @@ func (a *App) syncCursor() {
 			return
 		}
 		screen.ShowCursor(a.editor[0].x+a.s.col, a.editor[0].y+a.s.row-a.s.scroll)
+		// do not mess up with line highlight here
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
 	default:
@@ -622,13 +764,43 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			e.Value = line
 		}
 		a.s.col++
-		// if a.s.col == len(line) {
-		// 	// line end, see if there is a completion
-		// 	var completion string
-		// 	if completion != "" {
-		// 		line = line[:a.s.col] + completion
-		// 	}
-		// }
+
+		// completion
+		if a.s.col == len(line) && a.s.symbols != nil {
+			var keyword string
+			for i := len(line) - 1; i >= 0; i-- {
+				if line[i] == ' ' || line[i] == '\t' || line[i] == '.' {
+					keyword = line[i+1:]
+					break
+				}
+				if i == 0 {
+					keyword = line
+					break
+				}
+			}
+			if keyword == "" {
+				a.editor[a.s.row-a.s.scroll].draw(line)
+				return
+			}
+			var completion string
+			for k := range a.s.symbols {
+				// TODO: smart case
+				if strings.HasPrefix(k, keyword) {
+					completion = k[len(keyword):]
+					// this is inline completion, so one symbol is enough
+					break
+				}
+			}
+			if completion != "" {
+				a.s.completion = completion
+				a.editor[a.s.row-a.s.scroll].drawText(
+					textStyle{text: line},
+					textStyle{text: completion, style: tcell.StyleDefault.Foreground(tcell.ColorGray)},
+				)
+				return
+			}
+		}
+
 		a.editor[a.s.row-a.s.scroll].draw(line)
 	case tcell.KeyEnter:
 		if e := a.s.line(a.s.row); e == nil {
@@ -728,9 +900,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		if a.s.row < a.s.scroll {
 			a.s.scroll--
-			a.drawEditor()
-			return
 		}
+		a.drawEditor()
 	case tcell.KeyDown:
 		if a.s.row == a.s.lines.Len()-1 {
 			return // already at the bottom
@@ -750,9 +921,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		if a.s.row >= a.s.scroll+len(a.editor) {
 			a.s.scroll++
-			a.drawEditor()
-			return
 		}
+		a.drawEditor()
 	case tcell.KeyCtrlA:
 		a.s.col = 0
 	case tcell.KeyCtrlE:
@@ -761,5 +931,18 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 		a.s.col = len(e.Value.(string))
+	case tcell.KeyTAB:
+		s := "\t"
+		if a.s.completion != "" {
+			s = a.s.completion
+		}
+		line := a.s.line(a.s.row)
+		if line == nil {
+			line = a.s.lines.PushBack(s)
+		} else {
+			line.Value = line.Value.(string) + s
+		}
+		a.s.col += len(s)
+		a.editor[a.s.row-a.s.scroll].draw(line.Value.(string))
 	}
 }

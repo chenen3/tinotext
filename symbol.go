@@ -31,16 +31,16 @@ type Symbol struct {
 //  sync.RWMutex
 // }
 
-func ParseSymbol(filename string) (map[string][]Symbol, error) {
+func ParseSymbol(filename string) (map[string]Symbol, error) {
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, filename, nil, 0)
+	f, err := parser.ParseFile(fset, filename, nil, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	index := make(map[string][]Symbol)
+	index := make(map[string]Symbol)
 
-	ast.Inspect(node, func(n ast.Node) bool {
+	ast.Inspect(f, func(n ast.Node) bool {
 		switch node := n.(type) {
 
 		case *ast.FuncDecl:
@@ -57,16 +57,19 @@ func ParseSymbol(filename string) (map[string][]Symbol, error) {
 					}
 				}
 			}
-
+			name := node.Name.Name
+			if receiver != "" {
+				name = receiver + "." + node.Name.Name // e.g., "MyStruct.Foo"
+			}
 			sym := Symbol{
-				Name:     node.Name.Name,
+				Name:     name,
 				Kind:     SymbolFunc,
 				File:     filename,
 				Line:     pos.Line,
 				Column:   pos.Column,
 				Receiver: receiver,
 			}
-			index[sym.Name] = append(index[sym.Name], sym)
+			index[sym.Name] = sym
 
 		case *ast.GenDecl:
 			for _, spec := range node.Specs {
@@ -80,7 +83,7 @@ func ParseSymbol(filename string) (map[string][]Symbol, error) {
 						Line:   pos.Line,
 						Column: pos.Column,
 					}
-					index[sym.Name] = append(index[sym.Name], sym)
+					index[sym.Name] = sym
 
 				case *ast.ValueSpec:
 					for _, name := range ts.Names {
@@ -96,7 +99,7 @@ func ParseSymbol(filename string) (map[string][]Symbol, error) {
 							Line:   pos.Line,
 							Column: pos.Column,
 						}
-						index[sym.Name] = append(index[sym.Name], sym)
+						index[sym.Name] = sym
 					}
 				}
 			}
