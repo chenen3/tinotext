@@ -45,6 +45,15 @@ type State struct {
 	matchSymbols  []Symbol
 	matchIdx      int
 	completion    string
+
+	selecting         bool
+	selectionStartRow int
+	selectionStartCol int
+	selectionEndRow   int
+	selectionEndCol   int
+	// lastClickPos
+	// lastClickTime     time.Time // Time of the last mouse click
+	// clickCount        int       // Number of consecutive clicks
 }
 
 // line return the lineBuf in list
@@ -84,6 +93,11 @@ func (st *State) switchTab(i int) {
 	for _, line := range bytes.Split(bs, []byte{'\n'}) {
 		st.lines.PushBack(string(line))
 	}
+	symbols, err := ParseSymbol(file)
+	if err != nil {
+		log.Print(err)
+	}
+	st.symbols = symbols
 }
 
 // adjustIndex ensures the index not over the line end
@@ -200,8 +214,24 @@ func (a *App) drawEditor() {
 	remainlines := a.s.lines.Len() - a.s.scroll
 	for i, lineView := range a.editor {
 		if i < remainlines {
-			// TODO: highlight the gutter, not the line
-			lineView.draw(line.Value.(string))
+			text := line.Value.(string)
+			if a.s.selecting && a.s.selectionStartRow <= a.s.scroll+i && a.s.selectionEndRow >= a.s.scroll+i {
+				startCol := 0
+				endCol := len(text)
+				if a.s.selectionStartRow == a.s.scroll+i {
+					startCol = a.s.selectionStartCol
+				}
+				if a.s.selectionEndRow == a.s.scroll+i {
+					endCol = a.s.selectionEndCol
+				}
+				lineView.drawText(
+					textStyle{text: text[:startCol]},
+					textStyle{text: text[startCol:endCol], style: highlightStyle},
+					textStyle{text: text[endCol:]},
+				)
+			} else {
+				lineView.draw(text)
+			}
 			line = line.Next()
 		} else {
 			lineView.draw("")
@@ -373,9 +403,19 @@ func main() {
 			case *tcell.EventMouse:
 				x, y := ev.Position()
 				switch ev.Buttons() {
-				case tcell.Button1: // left click
+				case tcell.Button1:
+					// will receive this event many times
+					// when pressing left button and moving the mouse
+					log.Print("Mouse press at: ", x, y)
 					app.handleClick(x, y)
-				case tcell.ButtonNone: // drag
+				case tcell.ButtonNone:
+					// will receive this event when mouse is released
+					// or when mouse is moved without pressing any button
+					log.Print("Mouse release at: ", x, y)
+					if !app.s.selecting {
+						continue
+					}
+					app.s.selecting = false
 				case tcell.WheelUp:
 					app.s.scroll -= int(float32(y) * scrollFactor)
 					if app.s.scroll < 0 {
@@ -462,15 +502,26 @@ func (a *App) handleClick(x, y int) {
 		col := x - a.editor[0].x
 		a.s.col = adjustIndex(line, col)
 	}
+	if !a.s.selecting {
+		a.s.selectionStartRow = a.s.row
+		a.s.selectionStartCol = a.s.col
+		a.s.selectionEndRow = a.s.row
+		a.s.selectionEndCol = a.s.col
+		a.s.selecting = true
+	} else {
+		a.s.selectionEndRow = a.s.row
+		a.s.selectionEndCol = a.s.col
+	}
 
 	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 	a.syncCursor()
+	a.drawEditor()
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
-	if line := a.s.line(a.s.row); line != nil {
-		log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
-			line.Value.(string))
-	}
+	// if line := a.s.line(a.s.row); line != nil {
+	// 	log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
+	// 		line.Value.(string))
+	// }
 }
 
 // setStatus updates the status view with the given string.
@@ -705,7 +756,6 @@ func (a *App) handleCommand(cmd string) {
 			}
 			if e == start && reverse {
 				// reached the start again, no match found
-				a.setStatus("Text not found")
 				a.setConsole(cmd)
 				a.syncCursor()
 				return
