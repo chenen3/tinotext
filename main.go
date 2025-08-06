@@ -108,21 +108,22 @@ type View struct {
 	style      tcell.Style
 }
 
-// draw a line with a optional style
-func (v *View) draw(line string, style ...tcell.Style) {
-	s := v.style
-	if len(style) > 0 {
-		s = style[0]
-	}
+// draw draws a line and clears the remaining space
+func (v *View) draw(line string) {
 	for row := range v.h {
 		for col := range v.w {
 			if col < len(line) {
-				screen.SetContent(v.x+col, v.y+row, rune(line[col]), nil, s)
+				screen.SetContent(v.x+col, v.y+row, rune(line[col]), nil, v.style)
 			} else {
-				screen.SetContent(v.x+col, v.y+row, ' ', nil, s)
+				screen.SetContent(v.x+col, v.y+row, ' ', nil, v.style)
 			}
 		}
 	}
+}
+
+// drawEditorLine draws a line with automatic tab expansion for editor content
+func (v *View) drawEditorLine(line string) {
+	v.draw(expandTabs(line))
 }
 
 type textStyle struct {
@@ -130,7 +131,8 @@ type textStyle struct {
 	style tcell.Style
 }
 
-// draw inline texts with different styles
+// drawText draw inline texts with multiple styles.
+// Note that it does not handle tab expansion.
 func (v *View) drawText(texts ...textStyle) {
 	var col int
 	for _, ts := range texts {
@@ -165,6 +167,69 @@ func (a *App) resize() {
 }
 
 const tabCloser = " x|"
+const tabSize = 4
+
+// expandTabs converts all tabs in a line to spaces for display
+func expandTabs(line string) string {
+	var result strings.Builder
+	for _, char := range line {
+		if char == '\t' {
+			// Add spaces to reach the next tab stop
+			spaces := tabSize - (result.Len() % tabSize)
+			result.WriteString(strings.Repeat(" ", spaces))
+		} else {
+			result.WriteRune(char)
+		}
+	}
+	return result.String()
+}
+
+// columnToScreen converts a column position in the original line to the screen line
+func columnToScreen(line string, col int) int {
+	if col > len(line) {
+		col = len(line)
+	}
+
+	screenCol := 0
+	for i, char := range line {
+		if i >= col {
+			break
+		}
+		if char == '\t' {
+			spaces := tabSize - (screenCol % tabSize)
+			screenCol += spaces
+		} else {
+			screenCol++
+		}
+	}
+	return screenCol
+}
+
+// columnFromScreen converts a column position in the screen line back to the original line
+func columnFromScreen(line string, screenCol int) int {
+	if screenCol <= 0 {
+		return 0
+	}
+
+	originalCol := 0
+	currentScreenCol := 0
+
+	for i, char := range line {
+		if currentScreenCol >= screenCol {
+			return originalCol
+		}
+
+		if char == '\t' {
+			spaces := tabSize - (currentScreenCol % tabSize)
+			currentScreenCol += spaces
+		} else {
+			currentScreenCol++
+		}
+		originalCol = i + 1
+	}
+
+	return originalCol
+}
 
 // draw the whole layout and cursor
 func (a *App) draw() {
@@ -205,7 +270,7 @@ func (a *App) drawEditor() {
 	for range a.s.scroll {
 		e = e.Next()
 	}
-	leftLines := a.s.lines.Len() - a.s.scroll
+	remainLines := a.s.lines.Len() - a.s.scroll
 
 	var startRow, startCol, endRow, endCol int
 	if a.s.selecting {
@@ -218,7 +283,7 @@ func (a *App) drawEditor() {
 	}
 
 	for i, lineView := range a.editor {
-		if i >= leftLines {
+		if i >= remainLines {
 			lineView.draw("")
 			continue
 		}
@@ -226,24 +291,36 @@ func (a *App) drawEditor() {
 		line := e.Value.(string)
 		e = e.Next()
 		if !a.s.selecting || endRow < a.s.scroll+i || a.s.scroll+i < startRow {
-			lineView.draw(line)
+			lineView.drawEditorLine(line)
 			continue
 		}
 
-		start, end := 0, len(line)
+		screenLine := expandTabs(line)
+
+		// For selections, convert positions from original line to screen line
+		start, end := 0, len(screenLine)
 		if startRow == a.s.scroll+i {
-			start = startCol
+			start = columnToScreen(line, startCol)
 		}
 		if endRow == a.s.scroll+i {
-			end = endCol
+			end = columnToScreen(line, endCol)
 		}
 		if start > end {
 			start, end = end, start
 		}
+
+		// Ensure we don't go beyond the screen line length
+		if start > len(screenLine) {
+			start = len(screenLine)
+		}
+		if end > len(screenLine) {
+			end = len(screenLine)
+		}
+
 		lineView.drawText(
-			textStyle{text: line[:start]},
-			textStyle{text: line[start:end], style: highlightStyle},
-			textStyle{text: line[end:]},
+			textStyle{text: screenLine[:start]},
+			textStyle{text: screenLine[start:end], style: highlightStyle},
+			textStyle{text: screenLine[end:]},
 		)
 	}
 }
@@ -505,8 +582,9 @@ func (a *App) handleClick(x, y int) {
 	} else {
 		a.s.row = min(y-a.editor[0].y+a.s.scroll, a.s.lines.Len()-1)
 		line := a.s.line(a.s.row).Value.(string)
-		col := x - a.editor[0].x
-		a.s.col = min(len(line), col)
+		screenCol := x - a.editor[0].x
+		// Convert screen position back to original line position
+		a.s.col = min(len(line), columnFromScreen(line, screenCol))
 	}
 
 	if !a.s.selecting {
@@ -565,7 +643,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 		// reset matched text
 		if line := a.s.line(a.s.row); line != nil {
-			a.editor[a.s.row-a.s.scroll].draw(line.Value.(string))
+			a.editor[a.s.row-a.s.scroll].drawEditorLine(line.Value.(string))
 		}
 	case tcell.KeyEnter:
 		if a.s.console == "" {
@@ -795,11 +873,14 @@ func (a *App) handleCommand(cmd string) {
 				a.setConsole(cmd)
 				a.draw()
 				lineView := a.editor[a.s.row-a.s.scroll]
-				// highlight the found text
+				// highlight the found text with tab expansion
+				screenLine := expandTabs(line)
+				screenStart := columnToScreen(line, col+i)
+				screenEnd := columnToScreen(line, a.s.col)
 				lineView.drawText(
-					textStyle{text: line[:col+i]},
-					textStyle{text: line[col+i : a.s.col], style: highlightStyle},
-					textStyle{text: line[a.s.col:]},
+					textStyle{text: screenLine[:screenStart]},
+					textStyle{text: screenLine[screenStart:screenEnd], style: highlightStyle},
+					textStyle{text: screenLine[screenEnd:]},
 				)
 				return
 			}
@@ -842,7 +923,15 @@ func (a *App) syncCursor() {
 			screen.HideCursor()
 			return
 		}
-		screen.ShowCursor(a.editor[0].x+a.s.col, a.editor[0].y+a.s.row-a.s.scroll)
+		// Convert cursor position from original line to screen position
+		lineElement := a.s.line(a.s.row)
+		if lineElement == nil {
+			screen.HideCursor()
+			return
+		}
+		line := lineElement.Value.(string)
+		screenCol := columnToScreen(line, a.s.col)
+		screen.ShowCursor(a.editor[0].x+screenCol, a.editor[0].y+a.s.row-a.s.scroll)
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
 	default:
@@ -897,7 +986,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		// 	}
 		// }
 
-		a.editor[a.s.row-a.s.scroll].draw(line)
+		a.editor[a.s.row-a.s.scroll].drawEditorLine(line)
 	case tcell.KeyEnter:
 		if e := a.s.line(a.s.row); e == nil {
 			// file end
@@ -936,7 +1025,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		text = text[:a.s.col-1] + text[a.s.col:]
 		line.Value = text
 		a.s.col--
-		a.editor[a.s.row-a.s.scroll].draw(text)
+		a.editor[a.s.row-a.s.scroll].drawEditorLine(text)
 	case tcell.KeyLeft:
 		// file start
 		if a.s.row == 0 && a.s.col == 0 {
@@ -1040,6 +1129,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col += len(s)
 			e.Value = line
 		}
-		a.editor[a.s.row-a.s.scroll].draw(e.Value.(string))
+		a.editor[a.s.row-a.s.scroll].drawEditorLine(e.Value.(string))
 	}
 }
