@@ -14,6 +14,7 @@ const (
 	SymbolVar    SymbolKind = "var"
 	SymbolConst  SymbolKind = "const"
 	SymbolImport SymbolKind = "import"
+	SymbolField  SymbolKind = "field"
 )
 
 type Symbol struct {
@@ -22,24 +23,17 @@ type Symbol struct {
 	File     string     // absolute or relative path
 	Line     int        // line number
 	Column   int        // optional, for precision
-	Receiver string     // for method: struct name
+	Receiver string     // for method: struct name, for field: struct name
 }
 
-// type SymbolIndex struct {
-// 	Symbols       map[string][]Symbol // name → list of symbols
-// 	fileToSymbols map[string][]string
-//  sync.RWMutex
-// }
-
-func ParseSymbol(filename string) (map[string]Symbol, error) {
+func ParseSymbol(filename string) (map[string][]Symbol, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, nil, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	index := make(map[string]Symbol)
-
+	index := make(map[string][]Symbol)
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch node := n.(type) {
 
@@ -57,19 +51,15 @@ func ParseSymbol(filename string) (map[string]Symbol, error) {
 					}
 				}
 			}
-			name := node.Name.Name
-			if receiver != "" {
-				name = receiver + "." + node.Name.Name // e.g., "MyStruct.Foo"
-			}
 			sym := Symbol{
-				Name:     name,
+				Name:     node.Name.Name,
 				Kind:     SymbolFunc,
 				File:     filename,
 				Line:     pos.Line,
 				Column:   pos.Column,
 				Receiver: receiver,
 			}
-			index[sym.Name] = sym
+			index[sym.Name] = append(index[sym.Name], sym)
 
 		case *ast.GenDecl:
 			for _, spec := range node.Specs {
@@ -83,7 +73,25 @@ func ParseSymbol(filename string) (map[string]Symbol, error) {
 						Line:   pos.Line,
 						Column: pos.Column,
 					}
-					index[sym.Name] = sym
+					index[sym.Name] = append(index[sym.Name], sym)
+
+					// struct fields
+					if structType, ok := ts.Type.(*ast.StructType); ok {
+						for _, field := range structType.Fields.List {
+							for _, name := range field.Names {
+								fieldPos := fset.Position(name.Pos())
+								fieldSym := Symbol{
+									Name:     name.Name,
+									Kind:     SymbolField,
+									File:     filename,
+									Line:     fieldPos.Line,
+									Column:   fieldPos.Column,
+									Receiver: ts.Name.Name,
+								}
+								index[fieldSym.Name] = append(index[fieldSym.Name], fieldSym)
+							}
+						}
+					}
 
 				case *ast.ValueSpec:
 					for _, name := range ts.Names {
@@ -99,14 +107,12 @@ func ParseSymbol(filename string) (map[string]Symbol, error) {
 							Line:   pos.Line,
 							Column: pos.Column,
 						}
-						index[sym.Name] = sym
+						index[sym.Name] = append(index[sym.Name], sym)
 					}
 				}
 			}
 		}
-
 		return true
 	})
-
 	return index, nil
 }

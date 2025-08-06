@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"fmt"
@@ -29,31 +30,32 @@ type App struct {
 	done    chan struct{}
 }
 
+type selection struct {
+	startRow int
+	startCol int
+	endRow   int
+	endCol   int
+}
+
 type State struct {
 	tabs          []string
 	tabIdx        int
 	lines         *list.List
-	row           int               // Current row position (starts from 0)
-	col           int               // Current column position (starts from 0)
-	scroll        int               // Scroll position for the editor (starts from 0)
-	upDownCol     int               // Column to maintain while navigating up/down
-	status        string            // Status message displayed in the status bar
-	console       string            // Console input text
-	consoleCursor int               // Cursor position in the console
-	focus         int               // Current focus (editor or console)
-	symbols       map[string]Symbol // symbol name to list of symbols
+	row           int                 // Current row position (starts from 0)
+	col           int                 // Current column position (starts from 0)
+	scroll        int                 // Scroll position for the editor (starts from 0)
+	upDownCol     int                 // Column to maintain while navigating up/down
+	status        string              // Status message displayed in the status bar
+	console       string              // Console input text
+	consoleCursor int                 // Cursor position in the console
+	focus         int                 // Current focus (editor or console)
+	symbols       map[string][]Symbol // symbol name to list of symbols
 	matchSymbols  []Symbol
 	matchIdx      int
 	completion    string
 
-	selecting         bool
-	selectionStartRow int
-	selectionStartCol int
-	selectionEndRow   int
-	selectionEndCol   int
-	// lastClickPos
-	// lastClickTime     time.Time // Time of the last mouse click
-	// clickCount        int       // Number of consecutive clicks
+	selecting bool
+	selection *selection
 }
 
 // line return the lineBuf in list
@@ -62,15 +64,15 @@ func (st *State) line(i int) *list.Element {
 		return nil
 	}
 
-	l := st.lines.Front()
+	e := st.lines.Front()
 	for range i {
-		l = l.Next()
+		e = e.Next()
 	}
-	return l
+	return e
 }
 
 func (st *State) switchTab(i int) {
-	if i < 0 || i > len(st.tabs)-1 {
+	if i < 0 || i > len(st.tabs)-1 || i == st.tabIdx {
 		return
 	}
 
@@ -79,35 +81,26 @@ func (st *State) switchTab(i int) {
 	st.row = 0
 	st.col = 0
 	st.scroll = 0
-	st.symbols = nil
 
 	file := st.tabs[st.tabIdx]
 	if file == "" {
 		return
 	}
-	bs, err := os.ReadFile(file)
-	if err != nil {
-		log.Printf("Failed to open file %s: %v", file, err)
-		return
-	}
-	for _, line := range bytes.Split(bs, []byte{'\n'}) {
-		st.lines.PushBack(string(line))
-	}
-	symbols, err := ParseSymbol(file)
+
+	f, err := os.Open(file)
 	if err != nil {
 		log.Print(err)
+		return
 	}
-	st.symbols = symbols
-}
-
-// adjustIndex ensures the index not over the line end
-func adjustIndex(line string, i int) int {
-	if i < 0 {
-		return 0
-	} else if i >= len(line) {
-		return len(line)
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		st.lines.PushBack(scanner.Text())
 	}
-	return i
+	if err := scanner.Err(); err != nil {
+		log.Print(err)
+		return
+	}
 }
 
 type View struct {
@@ -160,14 +153,15 @@ func (v *View) contains(x, y int) bool {
 	return x >= v.x && x < v.x+v.w && y >= v.y && y < v.y+v.h
 }
 
-func (a *App) resize(width, height int) {
-	a.tab = View{0, 0, width, 1, tcell.StyleDefault.Reverse(true)}
-	a.editor = make([]*View, height-3)
+func (a *App) resize() {
+	w, h := screen.Size()
+	a.tab = View{0, 0, w, 1, tcell.StyleDefault.Reverse(true)}
+	a.editor = make([]*View, h-3)
 	for i := range a.editor {
-		a.editor[i] = &View{0, i + a.tab.h, width, 1, tcell.StyleDefault}
+		a.editor[i] = &View{0, i + a.tab.h, w, 1, tcell.StyleDefault}
 	}
-	a.status = View{0, height - 2, width, 1, tcell.StyleDefault.Reverse(true)}
-	a.console = View{0, height - 1, width, 1, tcell.StyleDefault}
+	a.status = View{0, h - 2, w, 1, tcell.StyleDefault.Reverse(true)}
+	a.console = View{0, h - 1, w, 1, tcell.StyleDefault}
 }
 
 const tabCloser = " x|"
@@ -207,35 +201,50 @@ func (a *App) drawTabs() {
 }
 
 func (a *App) drawEditor() {
-	line := a.s.lines.Front()
+	e := a.s.lines.Front()
 	for range a.s.scroll {
-		line = line.Next()
+		e = e.Next()
 	}
-	remainlines := a.s.lines.Len() - a.s.scroll
-	for i, lineView := range a.editor {
-		if i < remainlines {
-			text := line.Value.(string)
-			if a.s.selecting && a.s.selectionStartRow <= a.s.scroll+i && a.s.selectionEndRow >= a.s.scroll+i {
-				startCol := 0
-				endCol := len(text)
-				if a.s.selectionStartRow == a.s.scroll+i {
-					startCol = a.s.selectionStartCol
-				}
-				if a.s.selectionEndRow == a.s.scroll+i {
-					endCol = a.s.selectionEndCol
-				}
-				lineView.drawText(
-					textStyle{text: text[:startCol]},
-					textStyle{text: text[startCol:endCol], style: highlightStyle},
-					textStyle{text: text[endCol:]},
-				)
-			} else {
-				lineView.draw(text)
-			}
-			line = line.Next()
-		} else {
-			lineView.draw("")
+	leftLines := a.s.lines.Len() - a.s.scroll
+
+	var startRow, startCol, endRow, endCol int
+	if a.s.selecting {
+		startRow, startCol = a.s.selection.startRow, a.s.selection.startCol
+		endRow, endCol = a.s.selection.endRow, a.s.selection.endCol
+		if startRow > endRow {
+			startRow, endRow = endRow, startRow
+			startCol, endCol = endCol, startCol
 		}
+	}
+
+	for i, lineView := range a.editor {
+		if i >= leftLines {
+			lineView.draw("")
+			continue
+		}
+
+		line := e.Value.(string)
+		e = e.Next()
+		if !a.s.selecting || endRow < a.s.scroll+i || a.s.scroll+i < startRow {
+			lineView.draw(line)
+			continue
+		}
+
+		start, end := 0, len(line)
+		if startRow == a.s.scroll+i {
+			start = startCol
+		}
+		if endRow == a.s.scroll+i {
+			end = endCol
+		}
+		if start > end {
+			start, end = end, start
+		}
+		lineView.drawText(
+			textStyle{text: line[:start]},
+			textStyle{text: line[start:end], style: highlightStyle},
+			textStyle{text: line[end:]},
+		)
 	}
 }
 
@@ -314,8 +323,7 @@ func main() {
 		case ev := <-eventCh:
 			switch ev := ev.(type) {
 			case *tcell.EventResize: // arrive when the app start
-				w, h := s.Size()
-				app.resize(w, h)
+				app.resize()
 				app.draw()
 				s.Sync()
 			case *tcell.EventKey:
@@ -406,12 +414,10 @@ func main() {
 				case tcell.Button1:
 					// will receive this event many times
 					// when pressing left button and moving the mouse
-					log.Print("Mouse press at: ", x, y)
 					app.handleClick(x, y)
 				case tcell.ButtonNone:
 					// will receive this event when mouse is released
 					// or when mouse is moved without pressing any button
-					log.Print("Mouse release at: ", x, y)
 					if !app.s.selecting {
 						continue
 					}
@@ -500,17 +506,21 @@ func (a *App) handleClick(x, y int) {
 		a.s.row = min(y-a.editor[0].y+a.s.scroll, a.s.lines.Len()-1)
 		line := a.s.line(a.s.row).Value.(string)
 		col := x - a.editor[0].x
-		a.s.col = adjustIndex(line, col)
+		a.s.col = min(len(line), col)
 	}
+
 	if !a.s.selecting {
-		a.s.selectionStartRow = a.s.row
-		a.s.selectionStartCol = a.s.col
-		a.s.selectionEndRow = a.s.row
-		a.s.selectionEndCol = a.s.col
+		a.s.selection = &selection{
+			startRow: a.s.row,
+			startCol: a.s.col,
+			endRow:   a.s.row,
+			endCol:   a.s.col,
+		}
 		a.s.selecting = true
 	} else {
-		a.s.selectionEndRow = a.s.row
-		a.s.selectionEndCol = a.s.col
+		// draging the selection
+		a.s.selection.endRow = a.s.row
+		a.s.selection.endCol = a.s.col
 	}
 
 	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
@@ -615,13 +625,14 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		}
 		ts := make([]textStyle, len(a.s.matchSymbols))
 		for i, sym := range a.s.matchSymbols {
+			text := sym.Name + " "
+			if sym.Receiver != "" {
+				text = sym.Receiver + "." + sym.Name + " "
+			}
 			if i == a.s.matchIdx {
-				ts[i] = textStyle{
-					text:  sym.Name + " ",
-					style: highlightStyle,
-				}
+				ts[i] = textStyle{text: text, style: highlightStyle}
 			} else {
-				ts[i] = textStyle{text: sym.Name + " "}
+				ts[i] = textStyle{text: text}
 			}
 		}
 		a.status.drawText(ts...)
@@ -710,13 +721,27 @@ func (a *App) handleCommand(cmd string) {
 			return
 		}
 		var matched []Symbol
-		for k, v := range a.s.symbols {
-			if strings.Contains(strings.ToLower(k), strings.ToLower(symbolStr)) {
-				matched = append(matched, v)
+		for _, v := range a.s.symbols {
+			for _, sym := range v {
+				name := sym.Name
+				if sym.Receiver != "" {
+					name = sym.Receiver + "." + sym.Name
+				}
+				if strings.Contains(strings.ToLower(name), strings.ToLower(symbolStr)) {
+					matched = append(matched, sym)
+				}
 			}
 		}
 		slices.SortFunc(matched, func(a, b Symbol) int {
-			return strings.Compare(a.Name, b.Name)
+			nameA := a.Name
+			nameB := b.Name
+			if a.Receiver != "" {
+				nameA = a.Receiver + "." + a.Name
+			}
+			if b.Receiver != "" {
+				nameB = b.Receiver + "." + b.Name
+			}
+			return strings.Compare(nameA, nameB)
 		})
 		a.s.matchSymbols = matched
 		a.s.matchIdx = 0
@@ -726,13 +751,14 @@ func (a *App) handleCommand(cmd string) {
 		}
 		ts := make([]textStyle, len(matched))
 		for i, sym := range matched {
+			text := sym.Name + " "
+			if sym.Receiver != "" {
+				text = sym.Receiver + "." + sym.Name + " "
+			}
 			if i == a.s.matchIdx {
-				ts[i] = textStyle{
-					text:  sym.Name + " ",
-					style: highlightStyle,
-				}
+				ts[i] = textStyle{text: text, style: highlightStyle}
 			} else {
-				ts[i] = textStyle{text: sym.Name + " "}
+				ts[i] = textStyle{text: text}
 			}
 		}
 		a.status.drawText(ts...)
@@ -794,7 +820,7 @@ func (a *App) handleCommand(cmd string) {
 	}
 }
 
-var highlightStyle = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(paperColor)
+var highlightStyle = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightYellow)
 
 func (a *App) commandLoop() {
 	for {
@@ -807,9 +833,6 @@ func (a *App) commandLoop() {
 		}
 	}
 }
-
-// paper-like yellow color
-var paperColor = tcell.NewRGBColor(255, 249, 202)
 
 func (a *App) syncCursor() {
 	switch a.s.focus {
@@ -849,40 +872,30 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.col++
 
 		// completion
-		if a.s.col == len(line) && a.s.symbols != nil {
-			var keyword string
-			for i := len(line) - 1; i >= 0; i-- {
-				if line[i] == ' ' || line[i] == '\t' || line[i] == '.' {
-					keyword = line[i+1:]
-					break
-				}
-				if i == 0 {
-					keyword = line
-					break
-				}
-			}
-			if keyword == "" {
-				a.editor[a.s.row-a.s.scroll].draw(line)
-				return
-			}
-			var completion string
-			for k := range a.s.symbols {
-				// TODO: smart case
-				if strings.HasPrefix(k, keyword) {
-					completion = k[len(keyword):]
-					// this is inline completion, so one symbol is enough
-					break
-				}
-			}
-			if completion != "" {
-				a.s.completion = completion
-				a.editor[a.s.row-a.s.scroll].drawText(
-					textStyle{text: line},
-					textStyle{text: completion, style: tcell.StyleDefault.Foreground(tcell.ColorGray)},
-				)
-				return
-			}
-		}
+		// if a.s.col == len(line) && a.s.symbols != nil {
+		// 	var keyword string
+		// 	if i := strings.LastIndex(line, "."); i != -1 {
+		// 		keyword = line[i+1:]
+		// 	}
+		// 	if keyword == "" {
+		// 		a.editor[a.s.row-a.s.scroll].draw(line)
+		// 		return
+		// 	}
+		// 	log.Println("keyword:", keyword)
+		// 	var completion string
+		// 	for k, v := range a.s.symbols {
+		// 		if v.Kind == SymbolFunc && strings.HasPrefix(strings.ToLower(k), strings.ToLower(keyword)) {
+		// 			completion = k[len(keyword):]
+		// 			log.Print("completion:", completion)
+		// 			a.s.completion = completion
+		// 			a.editor[a.s.row-a.s.scroll].drawText(
+		// 				textStyle{text: line},
+		// 				textStyle{text: completion, style: tcell.StyleDefault.Foreground(tcell.ColorGray)},
+		// 			)
+		// 			return
+		// 		}
+		// 	}
+		// }
 
 		a.editor[a.s.row-a.s.scroll].draw(line)
 	case tcell.KeyEnter:
@@ -975,11 +988,11 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col = 0
 		} else if a.s.upDownCol >= 0 {
 			// moving up/down, keep previous column
-			a.s.col = adjustIndex(line, a.s.upDownCol)
+			a.s.col = min(len(line), a.s.upDownCol)
 		} else {
 			// start moving up/down, keep current column
 			a.s.upDownCol = a.s.col
-			a.s.col = adjustIndex(line, a.s.col)
+			a.s.col = min(len(line), a.s.col)
 		}
 		if a.s.row < a.s.scroll {
 			a.s.scroll--
@@ -997,11 +1010,11 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col = 0
 		} else if a.s.upDownCol >= 0 {
 			// moving up/down, keep previous column
-			a.s.col = adjustIndex(line, a.s.upDownCol)
+			a.s.col = min(len(line), a.s.upDownCol)
 		} else {
 			// start moving up/down, keep current column
 			a.s.upDownCol = a.s.col
-			a.s.col = adjustIndex(line, a.s.col)
+			a.s.col = min(len(line), a.s.col)
 		}
 		if a.s.row >= a.s.scroll+len(a.editor) {
 			a.s.scroll++
@@ -1018,16 +1031,15 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.col = len(e.Value.(string))
 	case tcell.KeyTAB:
 		s := "\t"
-		if a.s.completion != "" {
-			s = a.s.completion
-		}
-		line := a.s.line(a.s.row)
-		if line == nil {
-			line = a.s.lines.PushBack(s)
+		e := a.s.line(a.s.row)
+		if e == nil {
+			e = a.s.lines.PushBack(s)
 		} else {
-			line.Value = line.Value.(string) + s
+			line := e.Value.(string)
+			line = line[:a.s.col] + s + line[a.s.col:]
+			a.s.col += len(s)
+			e.Value = line
 		}
-		a.s.col += len(s)
-		a.editor[a.s.row-a.s.scroll].draw(line.Value.(string))
+		a.editor[a.s.row-a.s.scroll].draw(e.Value.(string))
 	}
 }
