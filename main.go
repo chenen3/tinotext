@@ -191,7 +191,8 @@ func (a *App) resize() {
 
 const tabSize = 4
 
-func lineIndentation(line string) string {
+// indentation returns the leading whitespace of a line
+func indentation(line string) string {
 	var indent strings.Builder
 	for _, char := range line {
 		if char == ' ' || char == '\t' {
@@ -1063,7 +1064,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		} else {
 			// break the line
 			line := e.Value.(string)
-			indent := lineIndentation(line)
+			indent := indentation(line)
 			a.s.lines.InsertAfter(indent+line[a.s.col:], e)
 			e.Value = line[:a.s.col]
 			a.s.col = len(indent)
