@@ -41,24 +41,25 @@ type State struct {
 	tabs          []string
 	tabIdx        int
 	lines         *list.List
-	row           int                 // Current row position (starts from 0)
-	col           int                 // Current column position (starts from 0)
-	scroll        int                 // Scroll position for the editor (starts from 0)
-	upDownCol     int                 // Column to maintain while navigating up/down
-	status        string              // Status message displayed in the status bar
-	console       string              // Console input text
-	consoleCursor int                 // Cursor position in the console
-	focus         int                 // Current focus (editor or console)
-	symbols       map[string][]Symbol // symbol name to list of symbols
-	matchSymbols  []Symbol
-	matchIdx      int
-	completion    string
+	row           int    // Current row position (starts from 0)
+	col           int    // Current column position (starts from 0)
+	scroll        int    // Scroll position for the editor (starts from 0)
+	upDownCol     int    // Column to maintain while navigating up/down
+	status        string // Status message displayed in the status bar
+	console       string // Console input text
+	consoleCursor int    // Cursor position in the console
+	focus         int    // Current focus (editor or console)
+
+	symbols      map[string][]Symbol // symbol name to list of symbols
+	matchSymbols []Symbol
+	matchIdx     int
+	completion   string
 
 	selecting bool
 	selection *selection
 }
 
-// line return the lineBuf in list
+// line returns the list element at the specified line index, or nil if out of bounds.
 func (st *State) line(i int) *list.Element {
 	if st.lines.Len() == 0 || i > st.lines.Len()-1 {
 		return nil
@@ -72,7 +73,7 @@ func (st *State) line(i int) *list.Element {
 }
 
 func (st *State) switchTab(i int) {
-	if i < 0 || i > len(st.tabs)-1 || i == st.tabIdx {
+	if i < 0 || i > len(st.tabs)-1 {
 		return
 	}
 
@@ -166,8 +167,19 @@ func (a *App) resize() {
 	a.console = View{0, h - 1, w, 1, tcell.StyleDefault}
 }
 
-const tabCloser = " x|"
 const tabSize = 4
+
+func lineIndentation(line string) string {
+	var indent strings.Builder
+	for _, char := range line {
+		if char == ' ' || char == '\t' {
+			indent.WriteRune(char)
+		} else {
+			break
+		}
+	}
+	return indent.String()
+}
 
 // expandTabs converts all tabs in a line to spaces for display
 func expandTabs(line string) string {
@@ -240,9 +252,16 @@ func (a *App) draw() {
 	a.syncCursor()
 }
 
+const (
+	tabCloser = " x|"
+	labelOpen = " Open "
+	labelSave = " Save "
+	labelQuit = " Quit "
+)
+
 func (a *App) drawTabs() {
 	var ts []textStyle
-	var col int
+	var totalTabWidth int
 	for i, tab := range a.s.tabs {
 		if tab == "" {
 			tab = "untitled"
@@ -254,14 +273,13 @@ func (a *App) drawTabs() {
 			ts = append(ts, textStyle{text: tab})
 			ts = append(ts, textStyle{text: tabCloser})
 		}
-		col += len(tab) + len(tabCloser)
+		totalTabWidth += len(tab) + len(tabCloser)
 	}
-	save := " Save "
-	quit := " Quit "
-	padding := max(0, a.tab.w-col-len(save)-len(quit))
+	padding := max(0, a.tab.w-totalTabWidth-len(labelOpen)-len(labelSave)-len(labelQuit))
 	ts = append(ts, textStyle{text: strings.Repeat(" ", padding)})
-	ts = append(ts, textStyle{text: save})
-	ts = append(ts, textStyle{text: quit})
+	ts = append(ts, textStyle{text: labelOpen})
+	ts = append(ts, textStyle{text: labelSave})
+	ts = append(ts, textStyle{text: labelQuit})
 	a.tab.drawText(ts...)
 }
 
@@ -308,15 +326,6 @@ func (a *App) drawEditor() {
 		if start > end {
 			start, end = end, start
 		}
-
-		// Ensure we don't go beyond the screen line length
-		if start > len(screenLine) {
-			start = len(screenLine)
-		}
-		if end > len(screenLine) {
-			end = len(screenLine)
-		}
-
 		lineView.drawText(
 			textStyle{text: screenLine[:start]},
 			textStyle{text: screenLine[start:end], style: highlightStyle},
@@ -415,11 +424,12 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlW {
-					app.cmdCh <- ">close " + strconv.Itoa(app.s.tabIdx)
+					app.s.closeTab(app.s.tabIdx)
 					if len(app.s.tabs) == 0 {
 						close(app.done)
 						return
 					}
+					app.draw()
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlO {
@@ -530,40 +540,78 @@ const scrollFactor = 0.1
 
 func (a *App) handleClick(x, y int) {
 	if a.tab.contains(x, y) {
-		var width int
-		for i, tab := range a.s.tabs {
+		var totalTabWidth int
+		for _, tab := range a.s.tabs {
 			if tab == "" {
 				tab = "untitled"
 			}
-			if x < a.tab.x+width+len(tab) {
-				if i != a.s.tabIdx {
-					a.s.switchTab(i)
-					a.s.focus = focusEditor
-					a.draw()
-				}
-				return
-			} else if x < a.tab.x+width+len(tab)+len(tabCloser) {
-				a.s.closeTab(i)
-				if len(a.s.tabs) == 0 {
-					close(a.done)
-					return
-				}
-				a.s.focus = focusEditor
-				a.draw()
-				return
-			}
-			width += len(tab) + len(tabCloser)
+			totalTabWidth += len(tab) + len(tabCloser)
 		}
 
-		saveLabelWidth := len(" Save ")
-		quitLabelWidth := len(" Quit ")
-		if x >= a.tab.x+a.tab.w-saveLabelWidth-quitLabelWidth && x < a.tab.x+a.tab.w-quitLabelWidth {
-			a.cmdCh <- ">save " + a.s.tabs[a.s.tabIdx]
+		// special labels area
+		specialLabelsStart := a.tab.x + a.tab.w - len(labelOpen) - len(labelSave) - len(labelQuit)
+
+		// Check if click is in special labels area
+		if x >= specialLabelsStart {
+			// Open label
+			if x < specialLabelsStart+len(labelOpen) {
+				a.s.focus = focusConsole
+				a.setStatus("open file")
+				a.setConsole("")
+				a.syncCursor()
+				return
+			}
+			// Save label
+			if x < specialLabelsStart+len(labelOpen)+len(labelSave) {
+				if len(a.s.tabs) > 0 && a.s.tabIdx < len(a.s.tabs) {
+					a.cmdCh <- ">save " + a.s.tabs[a.s.tabIdx]
+				}
+				return
+			}
+			// Quit label
+			if x < specialLabelsStart+len(labelOpen)+len(labelSave)+len(labelQuit) {
+				close(a.done)
+				return
+			}
 			return
 		}
-		if x >= a.tab.x+a.tab.w-quitLabelWidth {
-			close(a.done)
-			return
+
+		// Check tabs - only if click is in tabs area (not in special labels)
+		if x < a.tab.x+totalTabWidth {
+			var currentWidth int
+			for i, tab := range a.s.tabs {
+				if tab == "" {
+					tab = "untitled"
+				}
+
+				tabStart := a.tab.x + currentWidth
+				tabEnd := tabStart + len(tab)
+				closerEnd := tabEnd + len(tabCloser)
+
+				// Check if click is within this tab's area
+				if x >= tabStart && x < closerEnd {
+					if x < tabEnd {
+						// Clicked on tab name - switch tab
+						if i != a.s.tabIdx {
+							a.s.switchTab(i)
+							a.s.focus = focusEditor
+							a.draw()
+						}
+					} else {
+						// Clicked on tab closer - close tab
+						a.s.closeTab(i)
+						if len(a.s.tabs) == 0 {
+							close(a.done)
+							return
+						}
+						a.s.focus = focusEditor
+						a.draw()
+					}
+					return
+				}
+
+				currentWidth += len(tab) + len(tabCloser)
+			}
 		}
 		return
 	}
@@ -720,21 +768,32 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 	a.console.draw(a.s.console)
 }
 
+// closeTab closes the tab at the specified index and adjusts the current tab selection.
+// It handles edge cases for tab index management and ensures a valid tab remains active.
 func (st *State) closeTab(index int) {
 	if index < 0 || index >= len(st.tabs) {
 		return
 	}
+
 	st.tabs = slices.Delete(st.tabs, index, index+1)
 	if len(st.tabs) == 0 {
+		st.tabIdx = 0
 		return
 	}
-	if index < st.tabIdx {
+
+	switch {
+	case index < st.tabIdx:
+		// Closed tab was before current tab, shift index left
 		st.tabIdx--
-	} else if index == st.tabIdx {
+	case index == st.tabIdx:
+		// Closed the current tab, need to select a new one
 		if st.tabIdx >= len(st.tabs) {
 			st.tabIdx = len(st.tabs) - 1
 		}
+		// Switch to the tab now at the current index (could be same position, new tab)
 		st.switchTab(st.tabIdx)
+	case index > st.tabIdx:
+		// Closed tab was after current tab, no index adjustment needed
 	}
 }
 
@@ -992,12 +1051,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			// file end
 			a.s.lines.PushBack("")
 		} else {
-			// insert a new line after the current line
+			// break the line
 			line := e.Value.(string)
-			a.s.lines.InsertAfter(line[a.s.col:], e)
+			indent := lineIndentation(line)
+			a.s.lines.InsertAfter(indent+line[a.s.col:], e)
 			e.Value = line[:a.s.col]
+			a.s.col = len(indent)
 		}
-		a.s.col = 0
 		a.s.row++
 		if a.s.row >= a.s.scroll+len(a.editor) {
 			a.s.scroll++
