@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -28,13 +29,6 @@ type App struct {
 	console View
 	cmdCh   chan string
 	done    chan struct{}
-}
-
-type selection struct {
-	startRow int
-	startCol int
-	endRow   int
-	endCol   int
 }
 
 type State struct {
@@ -57,7 +51,32 @@ type State struct {
 
 	selecting bool
 	selection *selection
+
+	undoStack []Edit
+	redoStack []Edit
+	lastEdit  *Edit
 }
+
+type selection struct {
+	startRow int
+	startCol int
+	endRow   int
+	endCol   int
+}
+
+type Edit struct {
+	row     int
+	col     int
+	oldText string
+	newText string
+	kind    int
+	time    time.Time
+}
+
+const (
+	editInsert = iota
+	editDelete
+)
 
 // line returns the list element at the specified line index, or nil if out of bounds.
 func (st *State) line(i int) *list.Element {
@@ -1007,6 +1026,12 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 	}()
 	switch ev.Key() {
+	case tcell.KeyCtrlZ:
+		a.s.undo()
+		a.drawEditor()
+	case tcell.KeyCtrlY:
+		a.s.redo()
+		a.drawEditor()
 	case tcell.KeyRune:
 		var line string
 		if e := a.s.line(a.s.row); e == nil {
@@ -1017,36 +1042,18 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			line = line[:a.s.col] + string(ev.Rune()) + line[a.s.col:]
 			e.Value = line
 		}
+		a.s.recordEdit(Edit{
+			row:     a.s.row,
+			col:     a.s.col,
+			newText: string(ev.Rune()),
+			kind:    editInsert,
+		})
 		a.s.col++
-
-		// completion
-		// if a.s.col == len(line) && a.s.symbols != nil {
-		// 	var keyword string
-		// 	if i := strings.LastIndex(line, "."); i != -1 {
-		// 		keyword = line[i+1:]
-		// 	}
-		// 	if keyword == "" {
-		// 		a.editor[a.s.row-a.s.scroll].draw(line)
-		// 		return
-		// 	}
-		// 	log.Println("keyword:", keyword)
-		// 	var completion string
-		// 	for k, v := range a.s.symbols {
-		// 		if v.Kind == SymbolFunc && strings.HasPrefix(strings.ToLower(k), strings.ToLower(keyword)) {
-		// 			completion = k[len(keyword):]
-		// 			log.Print("completion:", completion)
-		// 			a.s.completion = completion
-		// 			a.editor[a.s.row-a.s.scroll].drawText(
-		// 				textStyle{text: line},
-		// 				textStyle{text: completion, style: tcell.StyleDefault.Foreground(tcell.ColorGray)},
-		// 			)
-		// 			return
-		// 		}
-		// 	}
-		// }
-
 		a.editor[a.s.row-a.s.scroll].drawEditorLine(line)
 	case tcell.KeyEnter:
+		a.s.lastEdit = nil
+		a.s.undoStack = nil
+		a.s.redoStack = nil
 		if e := a.s.line(a.s.row); e == nil {
 			// file end
 			a.s.lines.PushBack("")
@@ -1070,6 +1077,9 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				return // no line to delete
 			}
 
+			a.s.lastEdit = nil
+			a.s.undoStack = nil
+			a.s.redoStack = nil
 			line := a.s.line(a.s.row)
 			prevLine := line.Prev()
 			a.s.col = len(prevLine.Value.(string))
@@ -1082,11 +1092,19 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		line := a.s.line(a.s.row)
 		text := line.Value.(string)
+		deleted := text[a.s.col-1]
 		text = text[:a.s.col-1] + text[a.s.col:]
 		line.Value = text
+		a.s.recordEdit(Edit{
+			row:     a.s.row,
+			col:     a.s.col - 1,
+			oldText: string(deleted),
+			kind:    editDelete,
+		})
 		a.s.col--
 		a.editor[a.s.row-a.s.scroll].drawEditorLine(text)
 	case tcell.KeyLeft:
+		a.s.lastEdit = nil
 		// file start
 		if a.s.row == 0 && a.s.col == 0 {
 			return
@@ -1104,6 +1122,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.s.col--
 	case tcell.KeyRight:
+		a.s.lastEdit = nil
 		lineItem := a.s.line(a.s.row)
 		if lineItem == nil {
 			return
@@ -1127,6 +1146,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.drawEditor()
 		}
 	case tcell.KeyUp:
+		a.s.lastEdit = nil
 		if a.s.row == 0 {
 			return // already at the top
 		}
@@ -1149,6 +1169,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 	case tcell.KeyDown:
+		a.s.lastEdit = nil
 		if a.s.row == a.s.lines.Len()-1 {
 			return // already at the bottom
 		}
@@ -1171,14 +1192,17 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 	case tcell.KeyCtrlA:
+		a.s.lastEdit = nil
 		a.s.col = 0
 	case tcell.KeyCtrlE:
+		a.s.lastEdit = nil
 		e := a.s.line(a.s.row)
 		if e == nil {
 			return
 		}
 		a.s.col = len(e.Value.(string))
 	case tcell.KeyTAB:
+		a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: "\t", kind: editInsert})
 		s := "\t"
 		e := a.s.line(a.s.row)
 		if e == nil {
@@ -1191,4 +1215,89 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.editor[a.s.row-a.s.scroll].drawEditorLine(e.Value.(string))
 	}
+}
+
+func (st *State) undo() {
+	if len(st.undoStack) == 0 {
+		return
+	}
+
+	e := st.undoStack[len(st.undoStack)-1]
+	st.undoStack = st.undoStack[:len(st.undoStack)-1]
+	st.apply(reverse(e))
+	st.redoStack = append(st.redoStack, e)
+}
+
+func (st *State) redo() {
+	if len(st.redoStack) == 0 {
+		return
+	}
+	e := st.redoStack[len(st.redoStack)-1]
+	st.redoStack = st.redoStack[:len(st.redoStack)-1]
+	st.apply(e)
+	st.undoStack = append(st.undoStack, e)
+}
+
+func reverse(e Edit) Edit {
+	if e.kind == editInsert {
+		return Edit{
+			row:     e.row,
+			col:     e.col,
+			oldText: e.newText,
+			kind:    editDelete,
+		}
+	}
+	return Edit{
+		row:     e.row,
+		col:     e.col,
+		newText: e.oldText,
+		kind:    editInsert,
+	}
+}
+
+func (st *State) apply(e Edit) {
+	line := st.line(e.row)
+	if line == nil {
+		return
+	}
+	text := line.Value.(string)
+
+	switch e.kind {
+	case editInsert:
+		text = text[:e.col] + e.newText + text[e.col:]
+		st.col = e.col + len(e.newText)
+	case editDelete:
+		text = text[:e.col] + text[e.col+len(e.oldText):]
+		st.col = e.col
+	}
+	line.Value = text
+	st.row = e.row
+}
+
+// recordEdit adds an edit operation to the undo stack with intelligent coalescing.
+// It merges consecutive edits of the same type that occur within 1 second on the same row
+// to create more intuitive undo/redo behavior.
+func (s *State) recordEdit(e Edit) {
+	now := time.Now()
+
+	if s.lastEdit != nil && e.kind == s.lastEdit.kind &&
+		e.row == s.lastEdit.row && now.Sub(s.lastEdit.time) < time.Second {
+		if e.kind == editInsert && s.lastEdit.col+len(s.lastEdit.newText) == e.col {
+			s.lastEdit.newText += e.newText
+			s.lastEdit.time = now
+			return
+		}
+
+		if e.kind == editDelete && e.col == s.lastEdit.col-len(e.oldText) {
+			s.lastEdit.oldText = e.oldText + s.lastEdit.oldText
+			s.lastEdit.col = e.col
+			s.lastEdit.time = now
+			return
+		}
+	}
+
+	e.time = now
+	s.undoStack = append(s.undoStack, e)
+	s.redoStack = nil
+	s.lastEdit = &s.undoStack[len(s.undoStack)-1]
 }
