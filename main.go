@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -142,11 +143,6 @@ func (v *View) draw(line string) {
 			}
 		}
 	}
-}
-
-// drawEditorLine draws a line with automatic tab expansion for editor content
-func (v *View) drawEditorLine(line string) {
-	v.draw(expandTabs(line))
 }
 
 type textStyle struct {
@@ -306,6 +302,16 @@ func (a *App) drawTabs() {
 	a.tab.drawText(ts...)
 }
 
+// drawEditorLine draws the line with automatic tab expansion and syntax highlight
+func (a *App) drawEditorLine(row int, line string) {
+	line = expandTabs(line)
+	if a.s.tabs[a.s.tabIdx] == "" || !strings.HasSuffix(a.s.tabs[a.s.tabIdx], ".go") {
+		a.editor[row-a.s.scroll].draw(line)
+		return
+	}
+	a.editor[row-a.s.scroll].drawText(highlightGoLine(line)...)
+}
+
 func (a *App) drawEditor() {
 	e := a.s.lines.Front()
 	for range a.s.scroll {
@@ -313,13 +319,13 @@ func (a *App) drawEditor() {
 	}
 	remainLines := a.s.lines.Len() - a.s.scroll
 
-	var startRow, startCol, endRow, endCol int
-	if a.s.selecting {
-		startRow, startCol = a.s.selection.startRow, a.s.selection.startCol
-		endRow, endCol = a.s.selection.endRow, a.s.selection.endCol
-		if startRow > endRow {
-			startRow, endRow = endRow, startRow
-			startCol, endCol = endCol, startCol
+	var seleStartRow, seleStartCol, seleEndRow, seleEndCol int
+	if a.s.selection != nil {
+		seleStartRow, seleStartCol = a.s.selection.startRow, a.s.selection.startCol
+		seleEndRow, seleEndCol = a.s.selection.endRow, a.s.selection.endCol
+		if seleStartRow > seleEndRow {
+			seleStartRow, seleEndRow = seleEndRow, seleStartRow
+			seleStartCol, seleEndCol = seleEndCol, seleStartCol
 		}
 	}
 
@@ -330,30 +336,36 @@ func (a *App) drawEditor() {
 		}
 
 		line := e.Value.(string)
+		screenLine := expandTabs(line)
 		e = e.Next()
-		if !a.s.selecting || endRow < a.s.scroll+i || a.s.scroll+i < startRow {
-			lineView.drawEditorLine(line)
+
+		// selection highlight
+		if (seleStartRow != seleEndRow || seleStartCol != seleEndCol) &&
+			seleStartRow <= a.s.scroll+i && a.s.scroll+i <= seleEndRow {
+			start, end := 0, len(screenLine)
+			if seleStartRow == a.s.scroll+i {
+				start = columnToScreen(line, seleStartCol)
+			}
+			if seleEndRow == a.s.scroll+i {
+				end = columnToScreen(line, seleEndCol)
+			}
+			if start > end {
+				start, end = end, start
+			}
+			lineView.drawText(
+				textStyle{text: screenLine[:start]},
+				textStyle{text: screenLine[start:end], style: styleHighlight},
+				textStyle{text: screenLine[end:]},
+			)
 			continue
 		}
 
-		screenLine := expandTabs(line)
-
-		// For selections, convert positions from original line to screen line
-		start, end := 0, len(screenLine)
-		if startRow == a.s.scroll+i {
-			start = columnToScreen(line, startCol)
+		if a.s.tabs[a.s.tabIdx] == "" || !strings.HasSuffix(a.s.tabs[a.s.tabIdx], ".go") {
+			lineView.draw(screenLine)
+			continue
 		}
-		if endRow == a.s.scroll+i {
-			end = columnToScreen(line, endCol)
-		}
-		if start > end {
-			start, end = end, start
-		}
-		lineView.drawText(
-			textStyle{text: screenLine[:start]},
-			textStyle{text: screenLine[start:end], style: highlightStyle},
-			textStyle{text: screenLine[end:]},
-		)
+		// syntax highlight
+		lineView.drawText(highlightGoLine(screenLine)...)
 	}
 }
 
@@ -381,9 +393,8 @@ func main() {
 	if err := s.Init(); err != nil {
 		log.Fatalf("%+v", err)
 	}
-	defStyle := tcell.StyleDefault.Background(tcell.ColorReset).Foreground(tcell.ColorReset)
-	s.SetStyle(defStyle)
-	s.SetCursorStyle(tcell.CursorStyleBlinkingBlock)
+	s.SetStyle(styleDefault)
+	s.SetCursorStyle(tcell.CursorStyleBlinkingBlock, cursorColor)
 	s.EnableMouse()
 	s.EnablePaste()
 	s.Clear()
@@ -483,7 +494,14 @@ func main() {
 						app.setStatus("Not a Go file, cannot parse symbols")
 						continue
 					}
-					symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx])
+					var src string
+					for e := app.s.lines.Front(); e != nil; e = e.Next() {
+						if src != "" {
+							src += "\n"
+						}
+						src += e.Value.(string)
+					}
+					symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx], src)
 					if err != nil {
 						app.setStatus("Failed to parse symbols: " + err.Error())
 						continue
@@ -524,14 +542,21 @@ func main() {
 				case tcell.Button1:
 					// will receive this event many times
 					// when pressing left button and moving the mouse
+					// log.Print("Mouse left button clicked")
 					app.handleClick(x, y)
 				case tcell.ButtonNone:
-					// will receive this event when mouse is released
+					// will receive this event when mouse button is released
 					// or when mouse is moved without pressing any button
+					// log.Print("Mouse button released")
 					if !app.s.selecting {
 						continue
 					}
 					app.s.selecting = false
+					if app.s.selection.startRow == app.s.selection.endRow &&
+						app.s.selection.startCol == app.s.selection.endCol {
+						// no selection, reset
+						app.s.selection = nil
+					}
 				case tcell.WheelUp:
 					app.s.scroll -= int(float32(y) * scrollFactor)
 					if app.s.scroll < 0 {
@@ -677,10 +702,10 @@ func (a *App) handleClick(x, y int) {
 	a.drawEditor()
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
-	// if line := a.s.line(a.s.row); line != nil {
-	// 	log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
-	// 		line.Value.(string))
-	// }
+	if line := a.s.line(a.s.row); line != nil {
+		log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
+			line.Value.(string))
+	}
 }
 
 // setStatus updates the status view with the given string.
@@ -702,7 +727,13 @@ func (a *App) setConsole(s string) {
 func (a *App) jump(row, col int) {
 	a.s.row = row
 	a.s.col = col
-	a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
+	if a.s.row < len(a.editor) {
+		a.s.scroll = 0
+	} else if a.s.row > a.s.lines.Len()-len(a.editor) {
+		a.s.scroll = a.s.lines.Len() - len(a.editor)
+	} else {
+		a.s.scroll = a.s.row - len(a.editor)/2 // center the viewport
+	}
 }
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
@@ -714,7 +745,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 		// reset matched text
 		if line := a.s.line(a.s.row); line != nil {
-			a.editor[a.s.row-a.s.scroll].drawEditorLine(line.Value.(string))
+			a.drawEditorLine(a.s.row, line.Value.(string))
 		}
 	case tcell.KeyEnter:
 		if a.s.console == "" {
@@ -779,7 +810,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 				text = sym.Receiver + "." + sym.Name + " "
 			}
 			if i == a.s.matchIdx {
-				ts[i] = textStyle{text: text, style: highlightStyle}
+				ts[i] = textStyle{text: text, style: styleHighlight}
 			} else {
 				ts[i] = textStyle{text: text}
 			}
@@ -916,7 +947,7 @@ func (a *App) handleCommand(cmd string) {
 				text = sym.Receiver + "." + sym.Name + " "
 			}
 			if i == a.s.matchIdx {
-				ts[i] = textStyle{text: text, style: highlightStyle}
+				ts[i] = textStyle{text: text, style: styleHighlight}
 			} else {
 				ts[i] = textStyle{text: text}
 			}
@@ -961,7 +992,7 @@ func (a *App) handleCommand(cmd string) {
 				screenEnd := columnToScreen(line, a.s.col)
 				lineView.drawText(
 					textStyle{text: screenLine[:screenStart]},
-					textStyle{text: screenLine[screenStart:screenEnd], style: highlightStyle},
+					textStyle{text: screenLine[screenStart:screenEnd], style: styleHighlight},
 					textStyle{text: screenLine[screenEnd:]},
 				)
 				return
@@ -982,8 +1013,6 @@ func (a *App) handleCommand(cmd string) {
 		a.draw()
 	}
 }
-
-var highlightStyle = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorLightYellow)
 
 func (a *App) commandLoop() {
 	for {
@@ -1053,7 +1082,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			kind:    editInsert,
 		})
 		a.s.col++
-		a.editor[a.s.row-a.s.scroll].drawEditorLine(line)
+		a.drawEditorLine(a.s.row, line)
 	case tcell.KeyEnter:
 		a.s.lastEdit = nil
 		a.s.undoStack = nil
@@ -1106,7 +1135,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			kind:    editDelete,
 		})
 		a.s.col--
-		a.editor[a.s.row-a.s.scroll].drawEditorLine(text)
+		a.drawEditorLine(a.s.row, text)
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
 		// file start
@@ -1155,6 +1184,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return // already at the top
 		}
 
+		// command+up go to the start of file, works in kitty
+		if ev.Modifiers()&tcell.ModMeta != 0 {
+			a.jump(0, 0)
+			a.drawEditor()
+			return
+		}
+
 		a.s.row--
 		line := a.s.line(a.s.row).Value.(string)
 		if line == "" {
@@ -1178,6 +1214,20 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return // already at the bottom
 		}
 
+		// command+down go to the end of file, works in kitty
+		if ev.Modifiers()&tcell.ModMeta != 0 {
+			a.s.row = a.s.lines.Len() - 1
+			bottomLine := a.s.lines.Back()
+			if bottomLine == nil {
+				a.s.col = 0
+			} else {
+				a.s.col = len(bottomLine.Value.(string)) - 1
+			}
+			a.jump(a.s.row, a.s.col)
+			a.drawEditor()
+			return
+		}
+
 		a.s.row++
 		line := a.s.line(a.s.row).Value.(string)
 		if line == "" {
@@ -1195,10 +1245,21 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.drawEditor()
 			return
 		}
-	case tcell.KeyCtrlA:
+	case tcell.KeyCtrlA, tcell.KeyHome:
 		a.s.lastEdit = nil
-		a.s.col = 0
-	case tcell.KeyCtrlE:
+		// move to the first non-whitespace character
+		line := a.s.line(a.s.row)
+		if line == nil {
+			return
+		}
+		text := line.Value.(string)
+		for i, r := range text {
+			if r != ' ' && r != '\t' {
+				a.s.col = i
+				return
+			}
+		}
+	case tcell.KeyCtrlE, tcell.KeyEnd:
 		a.s.lastEdit = nil
 		e := a.s.line(a.s.row)
 		if e == nil {
@@ -1217,7 +1278,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col += len(s)
 			e.Value = line
 		}
-		a.editor[a.s.row-a.s.scroll].drawEditorLine(e.Value.(string))
+		a.drawEditorLine(a.s.row, e.Value.(string))
 	}
 }
 
@@ -1228,7 +1289,7 @@ func (st *State) undo() {
 
 	e := st.undoStack[len(st.undoStack)-1]
 	st.undoStack = st.undoStack[:len(st.undoStack)-1]
-	st.apply(reverse(e))
+	st.applyEdit(reverse(e))
 	st.redoStack = append(st.redoStack, e)
 }
 
@@ -1238,7 +1299,7 @@ func (st *State) redo() {
 	}
 	e := st.redoStack[len(st.redoStack)-1]
 	st.redoStack = st.redoStack[:len(st.redoStack)-1]
-	st.apply(e)
+	st.applyEdit(e)
 	st.undoStack = append(st.undoStack, e)
 }
 
@@ -1259,7 +1320,7 @@ func reverse(e Edit) Edit {
 	}
 }
 
-func (st *State) apply(e Edit) {
+func (st *State) applyEdit(e Edit) {
 	line := st.line(e.row)
 	if line == nil {
 		return
@@ -1281,29 +1342,29 @@ func (st *State) apply(e Edit) {
 // recordEdit adds an edit operation to the undo stack with intelligent coalescing.
 // It merges consecutive edits of the same type that occur within 1 second on the same row
 // to create more intuitive undo/redo behavior.
-func (s *State) recordEdit(e Edit) {
+func (st *State) recordEdit(e Edit) {
 	now := time.Now()
 
-	if s.lastEdit != nil && e.kind == s.lastEdit.kind &&
-		e.row == s.lastEdit.row && now.Sub(s.lastEdit.time) < time.Second {
-		if e.kind == editInsert && s.lastEdit.col+len(s.lastEdit.newText) == e.col {
-			s.lastEdit.newText += e.newText
-			s.lastEdit.time = now
+	if st.lastEdit != nil && e.kind == st.lastEdit.kind &&
+		e.row == st.lastEdit.row && now.Sub(st.lastEdit.time) < time.Second {
+		if e.kind == editInsert && st.lastEdit.col+len(st.lastEdit.newText) == e.col {
+			st.lastEdit.newText += e.newText
+			st.lastEdit.time = now
 			return
 		}
 
-		if e.kind == editDelete && e.col == s.lastEdit.col-len(e.oldText) {
-			s.lastEdit.oldText = e.oldText + s.lastEdit.oldText
-			s.lastEdit.col = e.col
-			s.lastEdit.time = now
+		if e.kind == editDelete && e.col == st.lastEdit.col-len(e.oldText) {
+			st.lastEdit.oldText = e.oldText + st.lastEdit.oldText
+			st.lastEdit.col = e.col
+			st.lastEdit.time = now
 			return
 		}
 	}
 
 	e.time = now
-	s.undoStack = append(s.undoStack, e)
-	s.redoStack = nil
-	s.lastEdit = &s.undoStack[len(s.undoStack)-1]
+	st.undoStack = append(st.undoStack, e)
+	st.redoStack = nil
+	st.lastEdit = &st.undoStack[len(st.undoStack)-1]
 }
 
 type SymbolKind string
@@ -1326,9 +1387,9 @@ type Symbol struct {
 	Receiver string     // for method: struct name, for field: struct name
 }
 
-func ParseSymbol(filename string) (map[string][]Symbol, error) {
+func ParseSymbol(filename string, src string) (map[string][]Symbol, error) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, filename, nil, 0)
+	f, err := parser.ParseFile(fset, filename, src, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1415,4 +1476,81 @@ func ParseSymbol(filename string) (map[string][]Symbol, error) {
 		return true
 	})
 	return index, nil
+}
+
+var (
+	styleDefault = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorWhite)
+
+	styleKeyword = styleDefault.Foreground(tcell.ColorRebeccaPurple).Italic(true).Bold(true)
+	styleString  = styleDefault.Foreground(tcell.ColorDarkRed)
+	styleComment = styleDefault.Foreground(tcell.ColorGray)
+	styleNumber  = styleDefault.Foreground(tcell.ColorBrown)
+
+	styleHighlight = styleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorYellow)
+
+	cursorColor = tcell.ColorDarkGray
+)
+
+func highlightGoLine(line string) []textStyle {
+	var parts []textStyle
+	runes := []rune(line)
+
+	var inString bool
+	var inComment bool
+	var word strings.Builder
+	flushWord := func() {
+		if word.Len() > 0 {
+			w := word.String()
+			if token.IsKeyword(w) {
+				parts = append(parts, textStyle{text: w, style: styleKeyword})
+			} else if _, err := strconv.Atoi(w); err == nil {
+				parts = append(parts, textStyle{text: w, style: styleNumber})
+			} else {
+				parts = append(parts, textStyle{text: w})
+			}
+			word.Reset()
+		}
+	}
+
+	for i := range runes {
+		c := runes[i]
+
+		// Line comment
+		if !inString && c == '/' && i+1 < len(runes) && runes[i+1] == '/' {
+			flushWord()
+			parts = append(parts, textStyle{text: string(runes[i:]), style: styleComment})
+			return parts
+		}
+
+		// Strings
+		if c == '"' && !inComment {
+			if inString {
+				word.WriteRune(c)
+				parts = append(parts, textStyle{text: word.String(), style: styleString})
+				word.Reset()
+				inString = false
+			} else {
+				flushWord()
+				word.WriteRune(c)
+				inString = true
+			}
+			continue
+		}
+
+		if inString {
+			word.WriteRune(c)
+			continue
+		}
+
+		// Word boundary
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' {
+			word.WriteRune(c)
+		} else {
+			flushWord()
+			parts = append(parts, textStyle{text: string(c)})
+		}
+	}
+
+	flushWord()
+	return parts
 }
