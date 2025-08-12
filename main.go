@@ -393,7 +393,7 @@ func main() {
 	if err := s.Init(); err != nil {
 		log.Fatalf("%+v", err)
 	}
-	s.SetStyle(styleDefault)
+	s.SetStyle(styleBase)
 	s.SetCursorStyle(tcell.CursorStyleBlinkingBlock, cursorColor)
 	s.EnableMouse()
 	s.EnablePaste()
@@ -1279,6 +1279,22 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			e.Value = line
 		}
 		a.drawEditorLine(a.s.row, e.Value.(string))
+	case tcell.KeyPgUp:
+		// go to previous page or the top of the page
+		a.s.row -= len(a.editor) - 2
+		if a.s.row < 0 {
+			a.s.row = 0
+		}
+		a.s.scroll = a.s.row
+		a.drawEditor()
+	case tcell.KeyPgDn:
+		// go to next page or the bottom of the page
+		a.s.row += len(a.editor) - 2
+		if a.s.row >= a.s.lines.Len() {
+			a.s.row = a.s.lines.Len() - 1
+		}
+		a.s.scroll = max(a.s.row-len(a.editor)+2, 0)
+		a.drawEditor()
 	}
 }
 
@@ -1479,14 +1495,12 @@ func ParseSymbol(filename string, src string) (map[string][]Symbol, error) {
 }
 
 var (
-	styleDefault = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorWhite)
-
-	styleKeyword = styleDefault.Foreground(tcell.ColorRebeccaPurple).Italic(true).Bold(true)
-	styleString  = styleDefault.Foreground(tcell.ColorDarkRed)
-	styleComment = styleDefault.Foreground(tcell.ColorGray)
-	styleNumber  = styleDefault.Foreground(tcell.ColorBrown)
-
-	styleHighlight = styleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorYellow)
+	styleBase      = tcell.StyleDefault.Foreground(tcell.ColorBlack).Background(tcell.ColorWhite)
+	styleKeyword   = styleBase.Foreground(tcell.ColorRebeccaPurple).Italic(true).Bold(true)
+	styleString    = styleBase.Foreground(tcell.ColorDarkRed)
+	styleComment   = styleBase.Foreground(tcell.ColorGray)
+	styleNumber    = styleBase.Foreground(tcell.ColorBrown)
+	styleHighlight = styleBase.Foreground(tcell.ColorBlack).Background(tcell.ColorLightSteelBlue)
 
 	cursorColor = tcell.ColorDarkGray
 )
