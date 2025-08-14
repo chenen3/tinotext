@@ -152,19 +152,6 @@ func (a *App) resize() {
 
 const tabSize = 4
 
-// indentation returns the leading whitespace of a line
-func indentation(line string) string {
-	var indent strings.Builder
-	for _, char := range line {
-		if char == ' ' || char == '\t' {
-			indent.WriteRune(char)
-		} else {
-			break
-		}
-	}
-	return indent.String()
-}
-
 // expandTabs converts all tabs in a line to spaces for display
 func expandTabs(line string) string {
 	var result strings.Builder
@@ -542,7 +529,7 @@ func main() {
 						continue
 					}
 					app.s.selecting = false
-					if app.s.selection.startRow == app.s.selection.endRow &&
+					if app.s.selection != nil && app.s.selection.startRow == app.s.selection.endRow &&
 						app.s.selection.startCol == app.s.selection.endCol {
 						// no selection, reset
 						app.s.selection = nil
@@ -1065,7 +1052,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.redo()
 		a.drawEditor()
 	case tcell.KeyRune:
-		var spanLines bool
 		var line string
 		e := a.s.line(a.s.row)
 		if e == nil {
@@ -1087,8 +1073,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			// Delete the selected text
 			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
 			a.s.selection = nil
-			a.s.row = selection.startRow
-			a.s.col = selection.startCol
 
 			// Insert the new rune
 			line = a.s.line(a.s.row).Value.(string)
@@ -1104,8 +1088,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				newText: newText,
 				kind:    editReplace,
 			})
-			spanLines = selection.startRow != selection.endRow
-			if spanLines {
+			if selection.startRow != selection.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else {
 				a.drawEditorLine(a.s.row, line)
@@ -1125,7 +1108,9 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		})
 		a.s.col++
 		a.drawEditorLine(a.s.row, line)
-	case tcell.KeyEnter:
+	case tcell.KeyEnter, tcell.KeyCtrlJ:
+		// for line breaks on pasting multiple lines,
+		// macOS Terminal and iTerm2 sends Enter, kitty sends Ctrl-J
 		a.s.lastEdit = nil
 		a.s.undoStack = nil
 		a.s.redoStack = nil
@@ -1134,11 +1119,11 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.lines.PushBack("")
 		} else {
 			// break the line
+			// a Enter may comes from paste, do not auto-indent
 			line := e.Value.(string)
-			indent := indentation(line)
-			a.s.lines.InsertAfter(indent+line[a.s.col:], e)
+			a.s.lines.InsertAfter(line[a.s.col:], e)
 			e.Value = line[:a.s.col]
-			a.s.col = len(indent)
+			a.s.col = 0
 		}
 		a.s.row++
 		if a.s.row >= a.s.scroll+len(a.editor) {
@@ -1150,16 +1135,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if selection := a.s.Selection(); selection != nil {
 			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
 			a.s.selection = nil
-			a.s.row = selection.startRow
-			a.s.col = selection.startCol
 			a.s.recordEdit(Edit{
 				row:     selection.startRow,
 				col:     selection.startCol,
 				oldText: deletedText,
 				kind:    editDelete,
 			})
-			spanLines := selection.startRow != selection.endRow
-			if spanLines {
+			if selection.startRow != selection.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
 				a.drawEditorLine(a.s.row, line.Value.(string))
@@ -1384,11 +1366,87 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.s.scroll = max(a.s.row-len(a.editor)+2, 0)
 		a.drawEditor()
+	case tcell.KeyCtrlC:
+		if selection := a.s.Selection(); selection != nil {
+			line := a.s.line(selection.startRow)
+			var s strings.Builder
+			if selection.startRow == selection.endRow {
+				// Single line selection
+				s.WriteString(line.Value.(string)[selection.startCol:selection.endCol])
+			} else {
+				for i := selection.startRow; i <= selection.endRow && line != nil; i++ {
+					text := line.Value.(string)
+					switch i {
+					case selection.startRow:
+						s.WriteString(text[selection.startCol:])
+						s.WriteString("\n")
+					case selection.endRow:
+						s.WriteString(text[:selection.endCol])
+					default:
+						s.WriteString(text)
+						s.WriteString("\n")
+					}
+					line = line.Next()
+				}
+			}
+			screen.SetClipboard([]byte(s.String()))
+			return
+		}
+
+		// Copy the current line to clipboard
+		line := a.s.line(a.s.row)
+		if line == nil {
+			return
+		}
+		text := line.Value.(string)
+		if text == "" {
+			return
+		}
+		screen.SetClipboard([]byte(text))
+	case tcell.KeyCtrlX:
+		if selection := a.s.Selection(); selection != nil {
+			// Cut the selected text
+			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+			a.s.selection = nil
+			a.s.recordEdit(Edit{
+				row:     selection.startRow,
+				col:     selection.startCol,
+				oldText: deletedText,
+				kind:    editDelete,
+			})
+			screen.SetClipboard([]byte(deletedText))
+			if selection.startRow != selection.endRow {
+				a.drawEditor() // Refresh full editor for multi-line changes
+			} else if line := a.s.line(a.s.row); line != nil {
+				a.drawEditorLine(a.s.row, line.Value.(string))
+			}
+			return
+		}
+
+		// Cut the current line
+		line := a.s.line(a.s.row)
+		if line == nil {
+			return
+		}
+		text := line.Value.(string)
+		if text == "" {
+			return
+		}
+		screen.SetClipboard([]byte(text))
+		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(text))
+		a.s.recordEdit(Edit{
+			row:     a.s.row,
+			col:     0,
+			oldText: deletedText,
+			kind:    editDelete,
+		})
+		a.drawEditor()
 	}
 }
 
 // insertAt inserts a string at a specific position in the editor.
 // If s contains multiple lines, it will be split and inserted accordingly.
+// It updates the cursor position to the end of the inserted text.
 func (st *State) insertAt(s string, row, col int) {
 	e := st.line(row)
 	if e == nil {
@@ -1441,6 +1499,7 @@ func (a *App) unselect() {
 }
 
 // Selection returns the current selection, ensuring it is in a consistent order.
+// TODO: do this on mouse button release?
 func (st *State) Selection() *Selection {
 	if st.selection == nil {
 		return nil
@@ -1461,43 +1520,42 @@ func (st *State) Selection() *Selection {
 }
 
 // deleteRange deletes a range of text [startRow:startCol, endRow:endCol) from the editor
+// and move the cursor to the start of the deleted range.
+// It returns the deleted text as a string.
 func (st *State) deleteRange(startRow, startCol, endRow, endCol int) string {
-	var deletedText strings.Builder
+	var deleted strings.Builder
 	if startRow == endRow {
 		// Single-line
 		line := st.line(startRow).Value.(string)
-		deletedText.WriteString(line[startCol:endCol])
+		deleted.WriteString(line[startCol:endCol])
 		line = line[:startCol] + line[endCol:]
 		st.line(startRow).Value = line
 	} else {
 		// Multi-line
-		// Delete from startCol to end of first line
-		firstLine := st.line(startRow)
-		firstLineText := firstLine.Value.(string)
-		deletedText.WriteString(firstLineText[startCol:])
-		deletedText.WriteString("\n")
-
-		// Delete complete lines between startRow+1 and endRow-1
-		current := firstLine.Next()
-		for row := startRow + 1; row < endRow; row++ {
-			next := current.Next()
-			deletedText.WriteString(current.Value.(string))
-			deletedText.WriteString("\n")
-			st.lines.Remove(current)
-			current = next
-		}
-
-		// Delete from start of last line to endCol
-		lastLine := firstLine.Next() // After deletions, this is the last line
-		if lastLine != nil {
-			lastLineText := lastLine.Value.(string)
-			deletedText.WriteString(lastLineText[:endCol])
-			lastLine.Value = firstLineText[:startCol] + lastLineText[endCol:]
-			// Remove the first line after merging
-			st.lines.Remove(firstLine)
+		line := st.line(startRow)
+		firstLineLeft := line.Value.(string)[:startCol]
+		for i := startRow; i <= endRow && line != nil; i++ {
+			text := line.Value.(string)
+			next := line.Next()
+			switch i {
+			case startRow:
+				deleted.WriteString(text[startCol:])
+				deleted.WriteString("\n")
+				st.lines.Remove(line)
+			case endRow:
+				deleted.WriteString(text[:endCol])
+				line.Value = firstLineLeft + text[endCol:]
+			default:
+				deleted.WriteString(text)
+				deleted.WriteString("\n")
+				st.lines.Remove(line)
+			}
+			line = next
 		}
 	}
-	return deletedText.String()
+	st.row = startRow
+	st.col = startCol
+	return deleted.String()
 }
 
 const (
