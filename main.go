@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"container/list"
 	"fmt"
 	"go/ast"
@@ -80,6 +79,7 @@ type Edit struct {
 const (
 	editInsert = iota
 	editDelete
+	editReplace
 )
 
 // line returns the list element at the specified line index, or nil if out of bounds.
@@ -95,6 +95,7 @@ func (st *State) line(i int) *list.Element {
 	return e
 }
 
+// switchTab clears the editor and switch to the specified tab.
 func (st *State) switchTab(i int) {
 	if i < 0 || i > len(st.tabs)-1 {
 		return
@@ -105,6 +106,10 @@ func (st *State) switchTab(i int) {
 	st.row = 0
 	st.col = 0
 	st.scroll = 0
+	st.undoStack = nil
+	st.redoStack = nil
+	st.lastEdit = nil
+	st.selection = nil
 
 	file := st.tabs[st.tabIdx]
 	if file == "" {
@@ -413,21 +418,29 @@ func main() {
 	defer quit()
 
 	app := &App{
-		s:     &State{lines: list.New(), tabs: []string{""}},
+		s:     &State{lines: list.New()},
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
 	}
 	go app.commandLoop()
 
+	app.s.tabs = []string{""}
 	if len(os.Args) >= 2 {
-		bs, err := os.ReadFile(os.Args[1])
+		filename := os.Args[1]
+		app.s.tabs = []string{filename}
+		f, err := os.Open(filename)
 		if err != nil {
 			log.Print(err)
+
 		} else {
-			app.s.tabs = []string{os.Args[1]}
-			for _, line := range bytes.Split(bs, []byte{'\n'}) {
-				app.s.lines.PushBack(string(line))
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				app.s.lines.PushBack(scanner.Text())
 			}
+			if err := scanner.Err(); err != nil {
+				log.Print(err)
+			}
+			f.Close()
 		}
 	}
 
@@ -494,14 +507,14 @@ func main() {
 						app.setStatus("Not a Go file, cannot parse symbols")
 						continue
 					}
-					var src string
+					var src strings.Builder
 					for e := app.s.lines.Front(); e != nil; e = e.Next() {
-						if src != "" {
-							src += "\n"
+						src.WriteString(e.Value.(string))
+						if e != app.s.lines.Back() {
+							src.WriteByte('\n')
 						}
-						src += e.Value.(string)
 					}
-					symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx], src)
+					symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx], src.String())
 					if err != nil {
 						app.setStatus("Failed to parse symbols: " + err.Error())
 						continue
@@ -527,6 +540,14 @@ func main() {
 				}
 				if ev.Key() == tcell.KeyCtrlS {
 					app.cmdCh <- ">save " + app.s.tabs[app.s.tabIdx]
+					continue
+				}
+				if ev.Key() == tcell.KeyCtrlT {
+					// new tab
+					app.s.tabs = append(app.s.tabs, "")
+					app.s.switchTab(len(app.s.tabs) - 1)
+					app.s.focus = focusEditor
+					app.draw()
 					continue
 				}
 
@@ -739,6 +760,7 @@ func (a *App) jump(row, col int) {
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEscape:
+		// exit console
 		a.s.console = ""
 		a.s.consoleCursor = 0
 		a.s.focus = focusEditor
@@ -1066,15 +1088,58 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.redo()
 		a.drawEditor()
 	case tcell.KeyRune:
+		var spanLines bool
 		var line string
-		if e := a.s.line(a.s.row); e == nil {
+		e := a.s.line(a.s.row)
+		if e == nil {
+			// No line exists, create a new one
 			line = string(ev.Rune())
 			a.s.lines.PushBack(line)
-		} else {
-			line = e.Value.(string)
-			line = line[:a.s.col] + string(ev.Rune()) + line[a.s.col:]
-			e.Value = line
+			a.s.recordEdit(Edit{
+				row:     a.s.row,
+				col:     a.s.col,
+				newText: string(ev.Rune()),
+				kind:    editInsert,
+			})
+			a.s.col++
+			a.drawEditorLine(a.s.row, line)
+			return
 		}
+
+		if selection := a.s.Selection(); selection != nil {
+			// Delete the selected text
+			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+			a.s.selection = nil
+			a.s.row = selection.startRow
+			a.s.col = selection.startCol
+
+			// Insert the new rune
+			line = a.s.line(a.s.row).Value.(string)
+			newText := string(ev.Rune())
+			line = line[:a.s.col] + newText + line[a.s.col:]
+			a.s.line(a.s.row).Value = line
+			a.s.col += len(newText)
+
+			a.s.recordEdit(Edit{
+				row:     selection.startRow,
+				col:     selection.startCol,
+				oldText: deletedText,
+				newText: newText,
+				kind:    editReplace,
+			})
+			spanLines = selection.startRow != selection.endRow
+			if spanLines {
+				a.drawEditor() // Refresh full editor for multi-line changes
+			} else {
+				a.drawEditorLine(a.s.row, line)
+			}
+			return
+		}
+
+		// No selection, insert rune normally
+		line = e.Value.(string)
+		line = line[:a.s.col] + string(ev.Rune()) + line[a.s.col:]
+		e.Value = line
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
 			col:     a.s.col,
@@ -1104,6 +1169,27 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		// Handle selection deletion
+		if selection := a.s.Selection(); selection != nil {
+			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+			a.s.selection = nil
+			a.s.row = selection.startRow
+			a.s.col = selection.startCol
+			a.s.recordEdit(Edit{
+				row:     selection.startRow,
+				col:     selection.startCol,
+				oldText: deletedText,
+				kind:    editDelete,
+			})
+			spanLines := selection.startRow != selection.endRow
+			if spanLines {
+				a.drawEditor() // Refresh full editor for multi-line changes
+			} else if line := a.s.line(a.s.row); line != nil {
+				a.drawEditorLine(a.s.row, line.Value.(string))
+			}
+			return
+		}
+
 		// backspace at line start, delete current line and move up
 		if a.s.col == 0 {
 			if a.s.row == 0 {
@@ -1138,6 +1224,14 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.drawEditorLine(a.s.row, text)
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
+		// move cursor to the start of the selection
+		if selection := a.s.Selection(); selection != nil {
+			a.s.row = selection.startRow
+			a.s.col = selection.startCol
+			a.unselect()
+			return
+		}
+
 		// file start
 		if a.s.row == 0 && a.s.col == 0 {
 			return
@@ -1156,6 +1250,14 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.col--
 	case tcell.KeyRight:
 		a.s.lastEdit = nil
+		// move cursor to the end of the selection
+		if selection := a.s.Selection(); selection != nil {
+			a.s.row = selection.endRow
+			a.s.col = selection.endCol
+			a.unselect()
+			return
+		}
+
 		lineItem := a.s.line(a.s.row)
 		if lineItem == nil {
 			return
@@ -1180,6 +1282,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 	case tcell.KeyUp:
 		a.s.lastEdit = nil
+		a.unselect()
+
 		if a.s.row == 0 {
 			return // already at the top
 		}
@@ -1210,6 +1314,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 	case tcell.KeyDown:
 		a.s.lastEdit = nil
+		a.unselect()
+
 		if a.s.row == a.s.lines.Len()-1 {
 			return // already at the bottom
 		}
@@ -1247,6 +1353,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 	case tcell.KeyCtrlA, tcell.KeyHome:
 		a.s.lastEdit = nil
+		a.unselect()
+
 		// move to the first non-whitespace character
 		line := a.s.line(a.s.row)
 		if line == nil {
@@ -1261,6 +1369,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 	case tcell.KeyCtrlE, tcell.KeyEnd:
 		a.s.lastEdit = nil
+		a.unselect()
+
 		e := a.s.line(a.s.row)
 		if e == nil {
 			return
@@ -1280,6 +1390,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.drawEditorLine(a.s.row, e.Value.(string))
 	case tcell.KeyPgUp:
+		a.unselect()
 		// go to previous page or the top of the page
 		a.s.row -= len(a.editor) - 2
 		if a.s.row < 0 {
@@ -1288,6 +1399,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.scroll = a.s.row
 		a.drawEditor()
 	case tcell.KeyPgDn:
+		a.unselect()
 		// go to next page or the bottom of the page
 		a.s.row += len(a.editor) - 2
 		if a.s.row >= a.s.lines.Len() {
@@ -1296,6 +1408,119 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.scroll = max(a.s.row-len(a.editor)+2, 0)
 		a.drawEditor()
 	}
+}
+
+// insertAt inserts a string at a specific position in the editor.
+// If s contains multiple lines, it will be split and inserted accordingly.
+func (st *State) insertAt(s string, row, col int) {
+	e := st.line(row)
+	if e == nil {
+		return
+	}
+
+	lines := strings.Split(s, "\n")
+	if len(lines) == 1 {
+		// Single line insertion
+		line := e.Value.(string)
+		line = line[:col] + s + line[col:]
+		e.Value = line
+		st.row = row
+		st.col = col + len(s)
+		return
+	}
+
+	origin := e.Value.(string)
+
+	// multi-line insertion
+	for i, line := range lines {
+		if i == 0 {
+			// First line
+			e.Value = origin[:col] + line
+		} else if i == len(lines)-1 {
+			// Last line
+			st.lines.InsertAfter(line+origin[col:], e)
+		} else {
+			// Middle lines
+			e = st.lines.InsertAfter(line, e)
+		}
+	}
+	st.row += len(lines) - 1
+	st.col = len(lines[len(lines)-1])
+}
+
+// unselect cancel the selection and redraws the affected lines.
+func (a *App) unselect() {
+	selection := a.s.Selection()
+	if selection == nil {
+		return
+	}
+
+	a.s.selection = nil
+	line := a.s.line(selection.startRow)
+	for i := selection.startRow; i <= selection.endRow && line != nil; i++ {
+		a.drawEditorLine(i, line.Value.(string))
+		line = line.Next()
+	}
+}
+
+// Selection returns the current selection, ensuring it is in a consistent order.
+func (st *State) Selection() *selection {
+	if st.selection == nil {
+		return nil
+	}
+	if st.selection.startRow == st.selection.endRow &&
+		st.selection.startCol == st.selection.endCol {
+		// No selection
+		return nil
+	}
+
+	if st.selection.startRow > st.selection.endRow ||
+		(st.selection.startRow == st.selection.endRow && st.selection.startCol > st.selection.endCol) {
+		// Swap if selection is reversed
+		st.selection.startRow, st.selection.endRow = st.selection.endRow, st.selection.startRow
+		st.selection.startCol, st.selection.endCol = st.selection.endCol, st.selection.startCol
+	}
+	return st.selection
+}
+
+// deleteRange deletes a range of text [startRow:startCol, endRow:endCol) from the editor
+func (st *State) deleteRange(startRow, startCol, endRow, endCol int) string {
+	var deletedText strings.Builder
+	if startRow == endRow {
+		// Single-line
+		line := st.line(startRow).Value.(string)
+		deletedText.WriteString(line[startCol:endCol])
+		line = line[:startCol] + line[endCol:]
+		st.line(startRow).Value = line
+	} else {
+		// Multi-line
+		// Delete from startCol to end of first line
+		firstLine := st.line(startRow)
+		firstLineText := firstLine.Value.(string)
+		deletedText.WriteString(firstLineText[startCol:])
+		deletedText.WriteString("\n")
+
+		// Delete complete lines between startRow+1 and endRow-1
+		current := firstLine.Next()
+		for row := startRow + 1; row < endRow; row++ {
+			next := current.Next()
+			deletedText.WriteString(current.Value.(string))
+			deletedText.WriteString("\n")
+			st.lines.Remove(current)
+			current = next
+		}
+
+		// Delete from start of last line to endCol
+		lastLine := firstLine.Next() // After deletions, this is the last line
+		if lastLine != nil {
+			lastLineText := lastLine.Value.(string)
+			deletedText.WriteString(lastLineText[:endCol])
+			lastLine.Value = firstLineText[:startCol] + lastLineText[endCol:]
+			// Remove the first line after merging
+			st.lines.Remove(firstLine)
+		}
+	}
+	return deletedText.String()
 }
 
 func (st *State) undo() {
@@ -1320,39 +1545,54 @@ func (st *State) redo() {
 }
 
 func reverse(e Edit) Edit {
-	if e.kind == editInsert {
+	switch e.kind {
+	case editInsert:
 		return Edit{
 			row:     e.row,
 			col:     e.col,
 			oldText: e.newText,
 			kind:    editDelete,
 		}
-	}
-	return Edit{
-		row:     e.row,
-		col:     e.col,
-		newText: e.oldText,
-		kind:    editInsert,
+	case editDelete:
+		return Edit{
+			row:     e.row,
+			col:     e.col,
+			newText: e.oldText,
+			kind:    editInsert,
+		}
+	case editReplace:
+		return Edit{
+			row:     e.row,
+			col:     e.col,
+			oldText: e.newText,
+			newText: e.oldText,
+			kind:    editReplace,
+		}
+	default:
+		return Edit{}
 	}
 }
 
 func (st *State) applyEdit(e Edit) {
-	line := st.line(e.row)
-	if line == nil {
-		return
-	}
-	text := line.Value.(string)
-
 	switch e.kind {
 	case editInsert:
-		text = text[:e.col] + e.newText + text[e.col:]
-		st.col = e.col + len(e.newText)
+		st.insertAt(e.newText, e.row, e.col)
 	case editDelete:
-		text = text[:e.col] + text[e.col+len(e.oldText):]
-		st.col = e.col
+		lines := strings.Split(e.oldText, "\n")
+		if len(lines) == 1 {
+			st.deleteRange(e.row, e.col, e.row, e.col+len(e.oldText))
+		} else {
+			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len(lines[len(lines)-1]))
+		}
+	case editReplace:
+		lines := strings.Split(e.oldText, "\n")
+		if len(lines) == 1 {
+			st.deleteRange(e.row, e.col, e.row, e.col+len(e.oldText))
+		} else {
+			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len(lines[len(lines)-1]))
+		}
+		st.insertAt(e.newText, e.row, e.col)
 	}
-	line.Value = text
-	st.row = e.row
 }
 
 // recordEdit adds an edit operation to the undo stack with intelligent coalescing.
@@ -1362,6 +1602,7 @@ func (st *State) recordEdit(e Edit) {
 	now := time.Now()
 
 	if st.lastEdit != nil && e.kind == st.lastEdit.kind &&
+		e.kind != editReplace && // Skip coalescing for replaces
 		e.row == st.lastEdit.row && now.Sub(st.lastEdit.time) < time.Second {
 		if e.kind == editInsert && st.lastEdit.col+len(st.lastEdit.newText) == e.col {
 			st.lastEdit.newText += e.newText
