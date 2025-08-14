@@ -35,60 +35,47 @@ type App struct {
 }
 
 type State struct {
-	tabs          []string
-	tabIdx        int
-	lines         *list.List
-	row           int    // Current row position (starts from 0)
-	col           int    // Current column position (starts from 0)
-	scroll        int    // Scroll position for the editor (starts from 0)
-	upDownCol     int    // Column to maintain while navigating up/down
+	*Tab          // active tab
+	tabs          []*Tab
+	activeTabIdx  int
 	status        string // Status message displayed in the status bar
 	console       string // Console input text
 	consoleCursor int    // Cursor position in the console
 	focus         int    // Current focus (editor or console)
+}
 
+type Tab struct {
+	filename     string
+	lines        *list.List
+	row          int                 // Current row position (starts from 0)
+	col          int                 // Current column position (starts from 0)
+	scroll       int                 // Scroll position for the editor (starts from 0)
+	upDownCol    int                 // Column to maintain while navigating up/down
 	symbols      map[string][]Symbol // symbol name to list of symbols
 	matchSymbols []Symbol
 	matchIdx     int
 	completion   string
-
-	selecting bool
-	selection *selection
-
-	undoStack []Edit
-	redoStack []Edit
-	lastEdit  *Edit
+	selecting    bool
+	selection    *Selection
+	undoStack    []Edit
+	redoStack    []Edit
+	lastEdit     *Edit
 }
 
-type selection struct {
+type Selection struct {
 	startRow int
 	startCol int
 	endRow   int
 	endCol   int
 }
 
-type Edit struct {
-	row     int
-	col     int
-	oldText string
-	newText string
-	kind    int
-	time    time.Time
-}
-
-const (
-	editInsert = iota
-	editDelete
-	editReplace
-)
-
 // line returns the list element at the specified line index, or nil if out of bounds.
-func (st *State) line(i int) *list.Element {
-	if st.lines.Len() == 0 || i > st.lines.Len()-1 {
+func (t *Tab) line(i int) *list.Element {
+	if t.lines.Len() == 0 || i > t.lines.Len()-1 {
 		return nil
 	}
 
-	e := st.lines.Front()
+	e := t.lines.Front()
 	for range i {
 		e = e.Next()
 	}
@@ -101,35 +88,8 @@ func (st *State) switchTab(i int) {
 		return
 	}
 
-	st.tabIdx = i
-	st.lines.Init()
-	st.row = 0
-	st.col = 0
-	st.scroll = 0
-	st.undoStack = nil
-	st.redoStack = nil
-	st.lastEdit = nil
-	st.selection = nil
-
-	file := st.tabs[st.tabIdx]
-	if file == "" {
-		return
-	}
-
-	f, err := os.Open(file)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		st.lines.PushBack(scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		log.Print(err)
-		return
-	}
+	st.activeTabIdx = i
+	st.Tab = st.tabs[i]
 }
 
 type View struct {
@@ -287,17 +247,18 @@ func (a *App) drawTabs() {
 	var ts []textStyle
 	var totalTabWidth int
 	for i, tab := range a.s.tabs {
-		if tab == "" {
-			tab = "untitled"
+		name := tab.filename
+		if name == "" {
+			name = "untitled"
 		}
-		if i == a.s.tabIdx {
-			ts = append(ts, textStyle{text: tab, style: a.tab.style.Bold(true).Underline(true).Italic(true)})
+		if i == a.s.activeTabIdx {
+			ts = append(ts, textStyle{text: name, style: a.tab.style.Bold(true).Underline(true).Italic(true)})
 			ts = append(ts, textStyle{text: tabCloser, style: a.tab.style.Bold(true)})
 		} else {
-			ts = append(ts, textStyle{text: tab})
+			ts = append(ts, textStyle{text: name})
 			ts = append(ts, textStyle{text: tabCloser})
 		}
-		totalTabWidth += len(tab) + len(tabCloser)
+		totalTabWidth += len(name) + len(tabCloser)
 	}
 	padding := max(0, a.tab.w-totalTabWidth-len(labelOpen)-len(labelSave)-len(labelQuit))
 	ts = append(ts, textStyle{text: strings.Repeat(" ", padding)})
@@ -310,7 +271,7 @@ func (a *App) drawTabs() {
 // drawEditorLine draws the line with automatic tab expansion and syntax highlight
 func (a *App) drawEditorLine(row int, line string) {
 	line = expandTabs(line)
-	if a.s.tabs[a.s.tabIdx] == "" || !strings.HasSuffix(a.s.tabs[a.s.tabIdx], ".go") {
+	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 		a.editor[row-a.s.scroll].draw(line)
 		return
 	}
@@ -365,7 +326,7 @@ func (a *App) drawEditor() {
 			continue
 		}
 
-		if a.s.tabs[a.s.tabIdx] == "" || !strings.HasSuffix(a.s.tabs[a.s.tabIdx], ".go") {
+		if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 			lineView.draw(screenLine)
 			continue
 		}
@@ -418,16 +379,21 @@ func main() {
 	defer quit()
 
 	app := &App{
-		s:     &State{lines: list.New()},
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
 	}
 	go app.commandLoop()
 
-	app.s.tabs = []string{""}
+	app.s = &State{
+		tabs: []*Tab{{
+			filename: "",
+			lines:    list.New(),
+		}},
+	}
+	app.s.Tab = app.s.tabs[0]
 	if len(os.Args) >= 2 {
 		filename := os.Args[1]
-		app.s.tabs = []string{filename}
+		app.s.tabs[0].filename = filename
 		f, err := os.Open(filename)
 		if err != nil {
 			log.Print(err)
@@ -471,7 +437,7 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlW {
-					app.s.closeTab(app.s.tabIdx)
+					app.s.closeTab(app.s.activeTabIdx)
 					if len(app.s.tabs) == 0 {
 						close(app.done)
 						return
@@ -503,7 +469,7 @@ func main() {
 						app.setStatus("Not a Go file, cannot parse symbols")
 						continue
 					}
-					if !strings.HasSuffix(app.s.tabs[app.s.tabIdx], ".go") {
+					if !strings.HasSuffix(app.s.filename, ".go") {
 						app.setStatus("Not a Go file, cannot parse symbols")
 						continue
 					}
@@ -514,7 +480,7 @@ func main() {
 							src.WriteByte('\n')
 						}
 					}
-					symbols, err := ParseSymbol(app.s.tabs[app.s.tabIdx], src.String())
+					symbols, err := ParseSymbol(app.s.filename, src.String())
 					if err != nil {
 						app.setStatus("Failed to parse symbols: " + err.Error())
 						continue
@@ -539,12 +505,15 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlS {
-					app.cmdCh <- ">save " + app.s.tabs[app.s.tabIdx]
+					app.cmdCh <- ">save " + app.s.filename
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlT {
 					// new tab
-					app.s.tabs = append(app.s.tabs, "")
+					app.s.tabs = append(app.s.tabs, &Tab{
+						filename: "",
+						lines:    list.New(),
+					})
 					app.s.switchTab(len(app.s.tabs) - 1)
 					app.s.focus = focusEditor
 					app.draw()
@@ -611,10 +580,11 @@ func (a *App) handleClick(x, y int) {
 	if a.tab.contains(x, y) {
 		var totalTabWidth int
 		for _, tab := range a.s.tabs {
-			if tab == "" {
-				tab = "untitled"
+			tabName := tab.filename
+			if tabName == "" {
+				tabName = "untitled"
 			}
-			totalTabWidth += len(tab) + len(tabCloser)
+			totalTabWidth += len(tabName) + len(tabCloser)
 		}
 
 		// special labels area
@@ -632,8 +602,8 @@ func (a *App) handleClick(x, y int) {
 			}
 			// Save label
 			if x < specialLabelsStart+len(labelOpen)+len(labelSave) {
-				if len(a.s.tabs) > 0 && a.s.tabIdx < len(a.s.tabs) {
-					a.cmdCh <- ">save " + a.s.tabs[a.s.tabIdx]
+				if len(a.s.tabs) > 0 && a.s.activeTabIdx < len(a.s.tabs) {
+					a.cmdCh <- ">save " + a.s.filename
 				}
 				return
 			}
@@ -649,19 +619,20 @@ func (a *App) handleClick(x, y int) {
 		if x < a.tab.x+totalTabWidth {
 			var currentWidth int
 			for i, tab := range a.s.tabs {
-				if tab == "" {
-					tab = "untitled"
+				tabName := tab.filename
+				if tabName == "" {
+					tabName = "untitled"
 				}
 
 				tabStart := a.tab.x + currentWidth
-				tabEnd := tabStart + len(tab)
+				tabEnd := tabStart + len(tabName)
 				closerEnd := tabEnd + len(tabCloser)
 
 				// Check if click is within this tab's area
 				if x >= tabStart && x < closerEnd {
 					if x < tabEnd {
 						// Clicked on tab name - switch tab
-						if i != a.s.tabIdx {
+						if i != a.s.activeTabIdx {
 							a.s.switchTab(i)
 							a.s.focus = focusEditor
 							a.draw()
@@ -679,7 +650,7 @@ func (a *App) handleClick(x, y int) {
 					return
 				}
 
-				currentWidth += len(tab) + len(tabCloser)
+				currentWidth += len(tabName) + len(tabCloser)
 			}
 		}
 		return
@@ -705,7 +676,7 @@ func (a *App) handleClick(x, y int) {
 	}
 
 	if !a.s.selecting {
-		a.s.selection = &selection{
+		a.s.selection = &Selection{
 			startRow: a.s.row,
 			startCol: a.s.col,
 			endRow:   a.s.row,
@@ -853,22 +824,22 @@ func (st *State) closeTab(index int) {
 
 	st.tabs = slices.Delete(st.tabs, index, index+1)
 	if len(st.tabs) == 0 {
-		st.tabIdx = 0
+		st.activeTabIdx = 0
 		return
 	}
 
 	switch {
-	case index < st.tabIdx:
+	case index < st.activeTabIdx:
 		// Closed tab was before current tab, shift index left
-		st.tabIdx--
-	case index == st.tabIdx:
+		st.activeTabIdx--
+	case index == st.activeTabIdx:
 		// Closed the current tab, need to select a new one
-		if st.tabIdx >= len(st.tabs) {
-			st.tabIdx = len(st.tabs) - 1
+		if st.activeTabIdx >= len(st.tabs) {
+			st.activeTabIdx = len(st.tabs) - 1
 		}
 		// Switch to the tab now at the current index (could be same position, new tab)
-		st.switchTab(st.tabIdx)
-	case index > st.tabIdx:
+		st.switchTab(st.activeTabIdx)
+	case index > st.activeTabIdx:
 		// Closed tab was after current tab, no index adjustment needed
 	}
 }
@@ -907,7 +878,7 @@ func (a *App) handleCommand(cmd string) {
 				a.setStatus("Failed to save file: " + err.Error())
 			} else {
 				a.setStatus("File saved as: " + filename)
-				a.s.tabs[a.s.tabIdx] = filename // update current tab
+				a.s.filename = filename // update current tab
 				a.s.focus = focusEditor
 			}
 		default:
@@ -1025,9 +996,15 @@ func (a *App) handleCommand(cmd string) {
 	default:
 		// open file
 		filename := cmd
-		i := slices.Index(a.s.tabs, filename)
+		i := -1
+		for j, tab := range a.s.tabs {
+			if tab.filename == filename {
+				i = j
+				break
+			}
+		}
 		if i < 0 {
-			a.s.tabs = append(a.s.tabs, filename)
+			a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: list.New()})
 			i = len(a.s.tabs) - 1
 		}
 		a.s.switchTab(i)
@@ -1464,7 +1441,7 @@ func (a *App) unselect() {
 }
 
 // Selection returns the current selection, ensuring it is in a consistent order.
-func (st *State) Selection() *selection {
+func (st *State) Selection() *Selection {
 	if st.selection == nil {
 		return nil
 	}
@@ -1523,25 +1500,19 @@ func (st *State) deleteRange(startRow, startCol, endRow, endCol int) string {
 	return deletedText.String()
 }
 
-func (st *State) undo() {
-	if len(st.undoStack) == 0 {
-		return
-	}
+const (
+	editInsert = iota
+	editDelete
+	editReplace
+)
 
-	e := st.undoStack[len(st.undoStack)-1]
-	st.undoStack = st.undoStack[:len(st.undoStack)-1]
-	st.applyEdit(reverse(e))
-	st.redoStack = append(st.redoStack, e)
-}
-
-func (st *State) redo() {
-	if len(st.redoStack) == 0 {
-		return
-	}
-	e := st.redoStack[len(st.redoStack)-1]
-	st.redoStack = st.redoStack[:len(st.redoStack)-1]
-	st.applyEdit(e)
-	st.undoStack = append(st.undoStack, e)
+type Edit struct {
+	row     int
+	col     int
+	oldText string
+	newText string
+	kind    int
+	time    time.Time
 }
 
 func reverse(e Edit) Edit {
@@ -1571,6 +1542,27 @@ func reverse(e Edit) Edit {
 	default:
 		return Edit{}
 	}
+}
+
+func (st *State) undo() {
+	if len(st.undoStack) == 0 {
+		return
+	}
+
+	e := st.undoStack[len(st.undoStack)-1]
+	st.undoStack = st.undoStack[:len(st.undoStack)-1]
+	st.applyEdit(reverse(e))
+	st.redoStack = append(st.redoStack, e)
+}
+
+func (st *State) redo() {
+	if len(st.redoStack) == 0 {
+		return
+	}
+	e := st.redoStack[len(st.redoStack)-1]
+	st.redoStack = st.redoStack[:len(st.redoStack)-1]
+	st.applyEdit(e)
+	st.undoStack = append(st.undoStack, e)
 }
 
 func (st *State) applyEdit(e Edit) {
