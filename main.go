@@ -990,13 +990,35 @@ func (a *App) handleCommand(cmd string) {
 				break
 			}
 		}
-		if i < 0 {
-			a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: list.New()})
-			i = len(a.s.tabs) - 1
+		if i >= 0 {
+			a.s.switchTab(i)
+			a.s.focus = focusEditor
+			a.draw()
+			return
 		}
-		a.s.switchTab(i)
+
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Print(err)
+			a.setStatus(err.Error())
+			return
+		}
+		defer file.Close()
+		lines := list.New()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			lines.PushBack(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			log.Print(err)
+			a.setStatus(err.Error())
+			return
+		}
+		a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: lines})
+		a.s.switchTab(len(a.s.tabs) - 1)
 		a.s.focus = focusEditor
 		a.draw()
+		return
 	}
 }
 
