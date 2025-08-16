@@ -224,10 +224,11 @@ func (a *App) draw() {
 }
 
 const (
-	tabCloser = " x|"
-	labelOpen = " Open "
-	labelSave = " Save "
-	labelQuit = " Quit "
+	labelClose = " x|"
+	labelNew   = " New "
+	labelOpen  = " Open "
+	labelSave  = " Save "
+	labelQuit  = " Quit "
 )
 
 func (a *App) drawTabs() {
@@ -240,18 +241,20 @@ func (a *App) drawTabs() {
 		}
 		if i == a.s.activeTabIdx {
 			ts = append(ts, textStyle{text: name, style: a.tab.style.Bold(true).Underline(true).Italic(true)})
-			ts = append(ts, textStyle{text: tabCloser, style: a.tab.style.Bold(true)})
+			ts = append(ts, textStyle{text: labelClose, style: a.tab.style.Bold(true)})
 		} else {
 			ts = append(ts, textStyle{text: name})
-			ts = append(ts, textStyle{text: tabCloser})
+			ts = append(ts, textStyle{text: labelClose})
 		}
-		totalTabWidth += len(name) + len(tabCloser)
+		totalTabWidth += len(name) + len(labelClose)
 	}
-	padding := max(0, a.tab.w-totalTabWidth-len(labelOpen)-len(labelSave)-len(labelQuit))
-	ts = append(ts, textStyle{text: strings.Repeat(" ", padding)})
-	ts = append(ts, textStyle{text: labelOpen})
-	ts = append(ts, textStyle{text: labelSave})
-	ts = append(ts, textStyle{text: labelQuit})
+
+	labels := labelNew + labelOpen + labelSave + labelQuit
+	padding := max(0, a.tab.w-totalTabWidth-len(labels))
+	if padding > 0 {
+		ts = append(ts, textStyle{text: strings.Repeat(" ", padding)})
+	}
+	ts = append(ts, textStyle{text: labels})
 	a.tab.drawText(ts...)
 }
 
@@ -571,16 +574,24 @@ func (a *App) handleClick(x, y int) {
 			if tabName == "" {
 				tabName = "untitled"
 			}
-			totalTabWidth += len(tabName) + len(tabCloser)
+			totalTabWidth += len(tabName) + len(labelClose)
 		}
+		padding := max(0, a.tab.w-totalTabWidth-len(labelNew)-len(labelOpen)-len(labelSave)-len(labelQuit))
 
 		// special labels area
-		specialLabelsStart := a.tab.x + a.tab.w - len(labelOpen) - len(labelSave) - len(labelQuit)
+		specialLabelsStart := a.tab.x + totalTabWidth + padding
 
 		// Check if click is in special labels area
 		if x >= specialLabelsStart {
+			// New label
+			if x < specialLabelsStart+len(labelNew) {
+				a.s.tabs = slices.Insert(a.s.tabs, a.s.activeTabIdx+1, &Tab{filename: "", lines: list.New()})
+				a.s.switchTab(a.s.activeTabIdx + 1)
+				a.draw()
+				return
+			}
 			// Open label
-			if x < specialLabelsStart+len(labelOpen) {
+			if x < specialLabelsStart+len(labelNew)+len(labelOpen) {
 				a.s.focus = focusConsole
 				a.setStatus("open file")
 				a.setConsole("")
@@ -588,14 +599,14 @@ func (a *App) handleClick(x, y int) {
 				return
 			}
 			// Save label
-			if x < specialLabelsStart+len(labelOpen)+len(labelSave) {
+			if x < specialLabelsStart+len(labelNew)+len(labelOpen)+len(labelSave) {
 				if len(a.s.tabs) > 0 && a.s.activeTabIdx < len(a.s.tabs) {
 					a.cmdCh <- ">save " + a.s.filename
 				}
 				return
 			}
 			// Quit label
-			if x < specialLabelsStart+len(labelOpen)+len(labelSave)+len(labelQuit) {
+			if x < specialLabelsStart+len(labelNew)+len(labelOpen)+len(labelSave)+len(labelQuit) {
 				close(a.done)
 				return
 			}
@@ -613,7 +624,7 @@ func (a *App) handleClick(x, y int) {
 
 				tabStart := a.tab.x + currentWidth
 				tabEnd := tabStart + len(tabName)
-				closerEnd := tabEnd + len(tabCloser)
+				closerEnd := tabEnd + len(labelClose)
 
 				// Check if click is within this tab's area
 				if x >= tabStart && x < closerEnd {
@@ -637,7 +648,7 @@ func (a *App) handleClick(x, y int) {
 					return
 				}
 
-				currentWidth += len(tabName) + len(tabCloser)
+				currentWidth += len(tabName) + len(labelClose)
 			}
 		}
 		return
@@ -1042,10 +1053,12 @@ func (a *App) syncCursor() {
 			screen.HideCursor()
 			return
 		}
-		// Convert cursor position from original line to screen position
 		lineElement := a.s.line(a.s.row)
 		if lineElement == nil {
-			screen.HideCursor()
+			if a.s.row == 0 && a.s.col == 0 {
+				// No line exists, cursor at start of editor
+				screen.ShowCursor(a.editor[0].x, a.editor[0].y)
+			}
 			return
 		}
 		line := lineElement.Value.(string)
