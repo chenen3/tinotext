@@ -42,6 +42,7 @@ type State struct {
 	console       string // Console input text
 	consoleCursor int    // Cursor position in the console
 	focus         int    // Current focus (editor or console)
+	lineNumber    bool   // Whether to show line numbers in the editor
 }
 
 type Tab struct {
@@ -266,21 +267,89 @@ func (a *App) drawTabs() {
 	a.tab.drawText(ts...)
 }
 
+func (st *State) newLineNum(row int) string {
+	var n int
+	for i := st.lines.Len(); i > 0; i = i / 10 {
+		n++
+	}
+	lineNumer := row + 1
+	var m int
+	for i := lineNumer; i > 0; i = i / 10 {
+		m++
+	}
+	// at least 1 space before the line number, 1 space after
+	return strings.Repeat(" ", n-m+1) + strconv.Itoa(lineNumer) + " "
+}
+
+func (st *State) lineNumLen() int {
+	if !st.lineNumber {
+		return 0
+	}
+
+	n := st.lines.Len()
+	if n == 0 {
+		return 0
+	}
+
+	length := 0
+	for n > 0 {
+		n /= 10
+		length++
+	}
+	return length + 2 // padding
+}
+
 // drawEditorLine draws the line with automatic tab expansion and syntax highlight
 func (a *App) drawEditorLine(row int, line string) {
-	line = expandTabs(line)
-	if 0 < a.s.left {
-		if a.s.left >= len(line) {
-			line = ""
+	var lineNumber string
+	if a.s.lineNumber {
+		lineNumber = a.s.newLineNum(row)
+	}
+
+	screenLine := expandTabs(line)
+	if a.s.left > 0 {
+		if a.s.left >= len(screenLine) {
+			screenLine = ""
 		} else {
-			line = line[a.s.left:]
+			screenLine = screenLine[a.s.left:]
 		}
 	}
-	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
-		a.editor[row-a.s.top].draw(line)
+
+	// selection highlight
+	if sel := a.s.Selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
+		start, end := 0, len(screenLine)
+		if sel.startRow == row {
+			start = columnToScreen(line, sel.startCol)
+		}
+		if sel.endRow == row {
+			end = columnToScreen(line, sel.endCol)
+		}
+		if start > end {
+			start, end = end, start
+		}
+		a.editor[row-a.s.top].drawText(
+			textStyle{text: lineNumber, style: styleComment},
+			textStyle{text: screenLine[:start]},
+			textStyle{text: screenLine[start:end], style: styleHighlight},
+			textStyle{text: screenLine[end:]},
+		)
 		return
 	}
-	a.editor[row-a.s.top].drawText(highlightGoLine(line)...)
+
+	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
+		a.editor[row-a.s.top].drawText(
+			textStyle{text: lineNumber, style: styleComment},
+			textStyle{text: screenLine},
+		)
+		return
+	}
+
+	// syntax highlight
+	parts := highlightGoLine(screenLine)
+	s := make([]textStyle, 0, len(parts)+1)
+	s = append(s, textStyle{text: lineNumber, style: styleComment})
+	s = append(s, parts...)
+	a.editor[row-a.s.top].drawText(s...)
 }
 
 func (a *App) drawEditor() {
@@ -290,60 +359,14 @@ func (a *App) drawEditor() {
 	}
 	remainLines := a.s.lines.Len() - a.s.top
 
-	var seleStartRow, seleStartCol, seleEndRow, seleEndCol int
-	if a.s.selection != nil {
-		seleStartRow, seleStartCol = a.s.selection.startRow, a.s.selection.startCol
-		seleEndRow, seleEndCol = a.s.selection.endRow, a.s.selection.endCol
-		if seleStartRow > seleEndRow {
-			seleStartRow, seleEndRow = seleEndRow, seleStartRow
-			seleStartCol, seleEndCol = seleEndCol, seleStartCol
-		}
-	}
-
 	for i, lineView := range a.editor {
 		if i >= remainLines {
 			lineView.draw("")
 			continue
 		}
-
 		line := e.Value.(string)
-		screenLine := expandTabs(line)
-		if a.s.left > 0 {
-			if a.s.left >= len(screenLine) {
-				screenLine = ""
-			} else {
-				screenLine = screenLine[a.s.left:]
-			}
-		}
+		a.drawEditorLine(a.s.top+i, line)
 		e = e.Next()
-
-		// selection highlight
-		if (seleStartRow != seleEndRow || seleStartCol != seleEndCol) &&
-			seleStartRow <= a.s.top+i && a.s.top+i <= seleEndRow {
-			start, end := 0, len(screenLine)
-			if seleStartRow == a.s.top+i {
-				start = columnToScreen(line, seleStartCol)
-			}
-			if seleEndRow == a.s.top+i {
-				end = columnToScreen(line, seleEndCol)
-			}
-			if start > end {
-				start, end = end, start
-			}
-			lineView.drawText(
-				textStyle{text: screenLine[:start]},
-				textStyle{text: screenLine[start:end], style: styleHighlight},
-				textStyle{text: screenLine[end:]},
-			)
-			continue
-		}
-
-		if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
-			lineView.draw(screenLine)
-			continue
-		}
-		// syntax highlight
-		lineView.drawText(highlightGoLine(screenLine)...)
 	}
 }
 
@@ -690,7 +713,8 @@ func (a *App) handleClick(x, y int) {
 	} else {
 		a.s.row = min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
 		line := a.s.line(a.s.row).Value.(string)
-		screenCol := x - a.editor[0].x + a.s.left
+
+		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
 		// Convert screen position back to original line position
 		a.s.col = min(len(line), columnFromScreen(line, screenCol))
 	}
@@ -753,7 +777,7 @@ func (a *App) jump(row, col int) {
 	a.s.col = col
 
 	var scroll bool
-	w, h := a.editor[0].w, len(a.editor)
+	h := len(a.editor)
 	if row == 0 {
 		a.s.top = 0
 		scroll = true
@@ -776,11 +800,12 @@ func (a *App) jump(row, col int) {
 		scroll = true
 	}
 
+	w := a.editor[0].w
 	if i := columnToScreen(line, a.s.col); i < a.s.left {
 		a.s.left = i
 		scroll = true
-	} else if i > a.s.left+w-1 {
-		a.s.left = i - w + 1
+	} else if i > a.s.left+(w-a.s.lineNumLen()-1) {
+		a.s.left = i - (w - a.s.lineNumLen() - 1)
 		scroll = true
 	}
 
@@ -912,6 +937,7 @@ func (st *State) closeTab(index int) {
 // - :<line_number> go to line
 // - @<symbol> go to symbol
 // - #<text> search text
+// - ><command>
 func (a *App) handleCommand(cmd string) {
 	// this function is called outside the main goroutine,
 	// so ensure to call screen.Show() after making changes to reflect updates.
@@ -943,6 +969,13 @@ func (a *App) handleCommand(cmd string) {
 				a.s.filename = filename // update current tab
 				a.s.focus = focusEditor
 			}
+		case "linenumber":
+			// toogle line number display
+			a.s.lineNumber = !a.s.lineNumber
+			// horizonal scroll may changed, update the cursor
+			a.jump(a.s.row, a.s.col)
+			a.s.focus = focusEditor
+			a.draw()
 		default:
 			a.setStatus("unknown command: " + cmd)
 		}
@@ -1125,9 +1158,10 @@ func (a *App) syncCursor() {
 			}
 			return
 		}
+
 		line := lineElement.Value.(string)
 		screenCol := columnToScreen(line, a.s.col) - a.s.left
-		screen.ShowCursor(a.editor[0].x+screenCol, a.editor[0].y+a.s.row-a.s.top)
+		screen.ShowCursor(a.editor[0].x+a.s.lineNumLen()+screenCol, a.editor[0].y+a.s.row-a.s.top)
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
 	default:
@@ -1168,7 +1202,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			// Delete the selected text
 			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
 			a.s.selection = nil
@@ -1229,7 +1263,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		// Handle selection deletion
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
 			a.s.selection = nil
 			a.s.recordEdit(Edit{
@@ -1283,7 +1317,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
 		// move cursor to the start of the selection
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			a.s.row = selection.startRow
 			a.s.col = selection.startCol
 			a.unselect()
@@ -1320,7 +1354,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyRight:
 		a.s.lastEdit = nil
 		// move cursor to the end of the selection
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			a.s.row = selection.endRow
 			a.s.col = selection.endCol
 			a.unselect()
@@ -1453,7 +1487,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.jump(a.s.row, a.s.col)
 	case tcell.KeyCtrlC:
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			line := a.s.line(selection.startRow)
 			var s strings.Builder
 			if selection.startRow == selection.endRow {
@@ -1490,7 +1524,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		screen.SetClipboard([]byte(text))
 	case tcell.KeyCtrlX:
-		if selection := a.s.Selection(); selection != nil {
+		if selection := a.s.Selected(); selection != nil {
 			// Cut the selected text
 			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
 			a.s.selection = nil
@@ -1571,7 +1605,7 @@ func (st *State) insertAt(s string, row, col int) {
 
 // unselect cancel the selection and redraws the affected lines.
 func (a *App) unselect() {
-	selection := a.s.Selection()
+	selection := a.s.Selected()
 	if selection == nil {
 		return
 	}
@@ -1584,9 +1618,11 @@ func (a *App) unselect() {
 	}
 }
 
-// Selection returns the current selection, ensuring it is in a consistent order.
+// Selected returns a copy of the current selection,
+// ensuring it is in a consistent order.
+// It returns nil if no avaiable selection exists.
 // TODO: do this on mouse button release?
-func (st *State) Selection() *Selection {
+func (st *State) Selected() *Selection {
 	if st.selection == nil {
 		return nil
 	}
@@ -1596,13 +1632,14 @@ func (st *State) Selection() *Selection {
 		return nil
 	}
 
-	if st.selection.startRow > st.selection.endRow ||
-		(st.selection.startRow == st.selection.endRow && st.selection.startCol > st.selection.endCol) {
+	sel := *st.selection
+	if sel.startRow > sel.endRow ||
+		(sel.startRow == sel.endRow && sel.startCol > sel.endCol) {
 		// Swap if selection is reversed
-		st.selection.startRow, st.selection.endRow = st.selection.endRow, st.selection.startRow
-		st.selection.startCol, st.selection.endCol = st.selection.endCol, st.selection.startCol
+		sel.startRow, sel.endRow = sel.endRow, sel.startRow
+		sel.startCol, sel.endCol = sel.endCol, sel.startCol
 	}
-	return st.selection
+	return &sel
 }
 
 // deleteRange deletes a range of text [startRow:startCol, endRow:endCol) from the editor
