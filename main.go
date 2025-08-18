@@ -49,7 +49,8 @@ type Tab struct {
 	lines        *list.List
 	row          int                 // Current row position (starts from 0)
 	col          int                 // Current column position (starts from 0)
-	scroll       int                 // Scroll position for the editor (starts from 0)
+	top          int                 // vertical scroll position for the editor (starts from 0)
+	left         int                 // horizontal scroll position on screen (starts from 0)
 	upDownCol    int                 // Column to maintain while navigating up/down
 	symbols      map[string][]Symbol // symbol name to list of symbols
 	matchSymbols []Symbol
@@ -73,6 +74,13 @@ type Selection struct {
 func (t *Tab) line(i int) *list.Element {
 	if t.lines.Len() == 0 || i > t.lines.Len()-1 {
 		return nil
+	}
+
+	if i == 0 {
+		return t.lines.Front()
+	}
+	if i == t.lines.Len()-1 {
+		return t.lines.Back()
 	}
 
 	e := t.lines.Front()
@@ -261,19 +269,26 @@ func (a *App) drawTabs() {
 // drawEditorLine draws the line with automatic tab expansion and syntax highlight
 func (a *App) drawEditorLine(row int, line string) {
 	line = expandTabs(line)
+	if 0 < a.s.left {
+		if a.s.left >= len(line) {
+			line = ""
+		} else {
+			line = line[a.s.left:]
+		}
+	}
 	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
-		a.editor[row-a.s.scroll].draw(line)
+		a.editor[row-a.s.top].draw(line)
 		return
 	}
-	a.editor[row-a.s.scroll].drawText(highlightGoLine(line)...)
+	a.editor[row-a.s.top].drawText(highlightGoLine(line)...)
 }
 
 func (a *App) drawEditor() {
 	e := a.s.lines.Front()
-	for range a.s.scroll {
+	for range a.s.top {
 		e = e.Next()
 	}
-	remainLines := a.s.lines.Len() - a.s.scroll
+	remainLines := a.s.lines.Len() - a.s.top
 
 	var seleStartRow, seleStartCol, seleEndRow, seleEndCol int
 	if a.s.selection != nil {
@@ -293,16 +308,23 @@ func (a *App) drawEditor() {
 
 		line := e.Value.(string)
 		screenLine := expandTabs(line)
+		if a.s.left > 0 {
+			if a.s.left >= len(screenLine) {
+				screenLine = ""
+			} else {
+				screenLine = screenLine[a.s.left:]
+			}
+		}
 		e = e.Next()
 
 		// selection highlight
 		if (seleStartRow != seleEndRow || seleStartCol != seleEndCol) &&
-			seleStartRow <= a.s.scroll+i && a.s.scroll+i <= seleEndRow {
+			seleStartRow <= a.s.top+i && a.s.top+i <= seleEndRow {
 			start, end := 0, len(screenLine)
-			if seleStartRow == a.s.scroll+i {
+			if seleStartRow == a.s.top+i {
 				start = columnToScreen(line, seleStartCol)
 			}
-			if seleEndRow == a.s.scroll+i {
+			if seleEndRow == a.s.top+i {
 				end = columnToScreen(line, seleEndCol)
 			}
 			if start > end {
@@ -538,21 +560,21 @@ func main() {
 						app.s.selection = nil
 					}
 				case tcell.WheelUp:
-					app.s.scroll -= int(float32(y) * scrollFactor)
-					if app.s.scroll < 0 {
-						app.s.scroll = 0
+					app.s.top -= int(float32(y) * scrollFactor)
+					if app.s.top < 0 {
+						app.s.top = 0
 					}
 					app.drawEditor()
 					app.syncCursor()
 				case tcell.WheelDown:
 					// keep in viewport
 					if app.s.lines.Len() < len(app.editor) {
-						app.s.scroll = 0
+						app.s.top = 0
 						continue
 					}
-					app.s.scroll += int(float32(y) * scrollFactor)
-					if app.s.scroll > app.s.lines.Len()-len(app.editor) {
-						app.s.scroll = app.s.lines.Len() - len(app.editor)
+					app.s.top += int(float32(y) * scrollFactor)
+					if app.s.top > app.s.lines.Len()-len(app.editor) {
+						app.s.top = app.s.lines.Len() - len(app.editor)
 						continue
 					}
 					app.drawEditor()
@@ -666,9 +688,9 @@ func (a *App) handleClick(x, y int) {
 		a.s.row = 0
 		a.s.col = 0
 	} else {
-		a.s.row = min(y-a.editor[0].y+a.s.scroll, a.s.lines.Len()-1)
+		a.s.row = min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
 		line := a.s.line(a.s.row).Value.(string)
-		screenCol := x - a.editor[0].x
+		screenCol := x - a.editor[0].x + a.s.left
 		// Convert screen position back to original line position
 		a.s.col = min(len(line), columnFromScreen(line, screenCol))
 	}
@@ -712,17 +734,59 @@ func (a *App) setConsole(s string) {
 }
 
 // jump moves the cursor to the specified line and column,
-// adjusting the scroll position to keep the line in view.
-// Note: it does not render the editor
+// If row less than 0, jump to the last line.
+// If col less than 0, jump to the end of the line.
+// To ensure the line is visible, it may scroll and redraw the editor.
 func (a *App) jump(row, col int) {
+	if row < 0 || row > a.s.lines.Len()-1 {
+		row = a.s.lines.Len() - 1
+	}
+	lineItem := a.s.line(row)
+	if lineItem == nil {
+		return
+	}
+	line := lineItem.Value.(string)
+	if col < 0 || col > len(line) {
+		col = len(line)
+	}
 	a.s.row = row
 	a.s.col = col
-	if a.s.row < len(a.editor) {
-		a.s.scroll = 0
-	} else if a.s.row > a.s.lines.Len()-len(a.editor) {
-		a.s.scroll = a.s.lines.Len() - len(a.editor)
-	} else {
-		a.s.scroll = a.s.row - len(a.editor)/2 // center the viewport
+
+	var scroll bool
+	w, h := a.editor[0].w, len(a.editor)
+	if row == 0 {
+		a.s.top = 0
+		scroll = true
+	} else if row == a.s.lines.Len()-1 {
+		a.s.top = max(0, a.s.lines.Len()-h)
+		scroll = true
+	} else if row < a.s.top {
+		if row == a.s.top-1 {
+			a.s.top -= 1 // scrolling up one line is more intuitive
+		} else {
+			a.s.top = max(0, row-h/2)
+		}
+		scroll = true
+	} else if row > a.s.top+h-1 {
+		if row == a.s.top+h {
+			a.s.top += 1 // scrolling down one line is more intuitive
+		} else {
+			a.s.top = row - h/2
+		}
+		scroll = true
+	}
+
+	if i := columnToScreen(line, a.s.col); i < a.s.left {
+		a.s.left = i
+		scroll = true
+	} else if i > a.s.left+w-1 {
+		a.s.left = i - w + 1
+		scroll = true
+	}
+
+	if scroll {
+		a.drawEditor()
+		a.syncCursor()
 	}
 }
 
@@ -972,11 +1036,11 @@ func (a *App) handleCommand(cmd string) {
 			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(text)); i > -1 {
 				a.s.row = row
 				a.s.col = col + i + len(text)
-				a.s.scroll = max(0, a.s.row-(len(a.editor)/2)) // viewport center
+				a.s.top = max(0, a.s.row-(len(a.editor)/2)) // viewport center
 				// incremental search
 				a.setConsole(cmd)
 				a.draw()
-				lineView := a.editor[a.s.row-a.s.scroll]
+				lineView := a.editor[a.s.row-a.s.top]
 				// highlight the found text with tab expansion
 				screenLine := expandTabs(line)
 				screenStart := columnToScreen(line, col+i)
@@ -1048,7 +1112,7 @@ func (a *App) commandLoop() {
 func (a *App) syncCursor() {
 	switch a.s.focus {
 	case focusEditor:
-		if a.s.row < a.s.scroll || a.s.row > (a.s.scroll+len(a.editor)-1) {
+		if a.s.row < a.s.top || a.s.row > (a.s.top+len(a.editor)-1) {
 			// out of viewport
 			screen.HideCursor()
 			return
@@ -1062,8 +1126,8 @@ func (a *App) syncCursor() {
 			return
 		}
 		line := lineElement.Value.(string)
-		screenCol := columnToScreen(line, a.s.col)
-		screen.ShowCursor(a.editor[0].x+screenCol, a.editor[0].y+a.s.row-a.s.scroll)
+		screenCol := columnToScreen(line, a.s.col) - a.s.left
+		screen.ShowCursor(a.editor[0].x+screenCol, a.editor[0].y+a.s.row-a.s.top)
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
 	default:
@@ -1074,7 +1138,7 @@ func (a *App) syncCursor() {
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
-		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+		a.setStatus(fmt.Sprintf("Line %d, Column %d, Top %d, Left %d", a.s.row+1, a.s.col+1, a.s.top+1, a.s.left+1))
 		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
 			a.s.upDownCol = -1
 		}
@@ -1141,8 +1205,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			newText: string(ev.Rune()),
 			kind:    editInsert,
 		})
-		a.s.col++
 		a.drawEditorLine(a.s.row, line)
+		a.jump(a.s.row, a.s.col+1)
 	case tcell.KeyEnter, tcell.KeyCtrlJ:
 		// for line breaks on pasting multiple lines,
 		// macOS Terminal and iTerm2 sends Enter, kitty sends Ctrl-J
@@ -1161,9 +1225,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col = 0
 		}
 		a.s.row++
-		if a.s.row >= a.s.scroll+len(a.editor) {
-			a.s.scroll++
-		}
+		a.jump(a.s.row, a.s.col)
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		// Handle selection deletion
@@ -1199,6 +1261,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			prevLine.Value = prevLine.Value.(string) + line.Value.(string)
 			a.s.lines.Remove(line)
 			a.s.row--
+			a.jump(a.s.row, a.s.col)
 			a.drawEditor()
 			return
 		}
@@ -1215,6 +1278,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			kind:    editDelete,
 		})
 		a.s.col--
+		a.jump(a.s.row, a.s.col)
 		a.drawEditorLine(a.s.row, text)
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
@@ -1230,18 +1294,29 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if a.s.row == 0 && a.s.col == 0 {
 			return
 		}
-		if a.s.col == 0 {
-			// move to previous line
-			a.s.row--
-			line := a.s.line(a.s.row).Value.(string)
-			a.s.col = len(line)
-			if a.s.row < a.s.scroll {
-				a.s.scroll--
-				a.drawEditor()
+
+		// command+left go to the start of line, works in kitty
+		if ev.Modifiers()&tcell.ModMeta != 0 {
+			line := a.s.line(a.s.row)
+			if line == nil {
+				return
 			}
+			text := line.Value.(string)
+			for i, r := range text {
+				if r != ' ' && r != '\t' {
+					a.s.col = i
+					break
+				}
+			}
+			a.jump(a.s.row, a.s.col)
 			return
 		}
-		a.s.col--
+
+		if a.s.col == 0 {
+			a.jump(a.s.row-1, -1)
+			return
+		}
+		a.jump(a.s.row, a.s.col-1)
 	case tcell.KeyRight:
 		a.s.lastEdit = nil
 		// move cursor to the end of the selection
@@ -1252,28 +1327,27 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
+		// command+right go to the end of line, works in kitty
+		if ev.Modifiers()&tcell.ModMeta != 0 {
+			a.jump(a.s.row, -1)
+			return
+		}
+
 		lineItem := a.s.line(a.s.row)
 		if lineItem == nil {
 			return
 		}
-
 		line := lineItem.Value.(string)
 		// middle of the line
 		if a.s.col < len(line) {
-			a.s.col++
+			a.jump(a.s.row, a.s.col+1)
 			return
 		}
 		// file end
 		if lineItem.Next() == nil {
 			return
 		}
-		// line end, move to next line
-		a.s.row++
-		a.s.col = 0
-		if a.s.row >= a.s.scroll+len(a.editor) {
-			a.s.scroll++
-			a.drawEditor()
-		}
+		a.jump(a.s.row+1, 0)
 	case tcell.KeyUp:
 		a.s.lastEdit = nil
 		a.unselect()
@@ -1285,7 +1359,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		// command+up go to the start of file, works in kitty
 		if ev.Modifiers()&tcell.ModMeta != 0 {
 			a.jump(0, 0)
-			a.drawEditor()
 			return
 		}
 
@@ -1301,11 +1374,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.upDownCol = a.s.col
 			a.s.col = min(len(line), a.s.col)
 		}
-		if a.s.row < a.s.scroll {
-			a.s.scroll--
-			a.drawEditor()
-			return
-		}
+		a.jump(a.s.row, a.s.col)
 	case tcell.KeyDown:
 		a.s.lastEdit = nil
 		a.unselect()
@@ -1316,15 +1385,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		// command+down go to the end of file, works in kitty
 		if ev.Modifiers()&tcell.ModMeta != 0 {
-			a.s.row = a.s.lines.Len() - 1
-			bottomLine := a.s.lines.Back()
-			if bottomLine == nil {
-				a.s.col = 0
-			} else {
-				a.s.col = len(bottomLine.Value.(string)) - 1
-			}
-			a.jump(a.s.row, a.s.col)
-			a.drawEditor()
+			a.jump(-1, -1)
 			return
 		}
 
@@ -1340,12 +1401,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.upDownCol = a.s.col
 			a.s.col = min(len(line), a.s.col)
 		}
-		if a.s.row >= a.s.scroll+len(a.editor) {
-			a.s.scroll++
-			a.drawEditor()
-			return
-		}
-	case tcell.KeyCtrlA, tcell.KeyHome:
+		a.jump(a.s.row, a.s.col)
+	case tcell.KeyHome:
 		a.s.lastEdit = nil
 		a.unselect()
 
@@ -1358,18 +1415,14 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		for i, r := range text {
 			if r != ' ' && r != '\t' {
 				a.s.col = i
-				return
+				break
 			}
 		}
-	case tcell.KeyCtrlE, tcell.KeyEnd:
+		a.jump(a.s.row, a.s.col)
+	case tcell.KeyEnd:
 		a.s.lastEdit = nil
 		a.unselect()
-
-		e := a.s.line(a.s.row)
-		if e == nil {
-			return
-		}
-		a.s.col = len(e.Value.(string))
+		a.jump(a.s.row, -1)
 	case tcell.KeyTAB:
 		a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: "\t", kind: editInsert})
 		s := "\t"
@@ -1390,8 +1443,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if a.s.row < 0 {
 			a.s.row = 0
 		}
-		a.s.scroll = a.s.row
-		a.drawEditor()
+		a.jump(a.s.row, a.s.col)
 	case tcell.KeyPgDn:
 		a.unselect()
 		// go to next page or the bottom of the page
@@ -1399,8 +1451,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if a.s.row >= a.s.lines.Len() {
 			a.s.row = a.s.lines.Len() - 1
 		}
-		a.s.scroll = max(a.s.row-len(a.editor)+2, 0)
-		a.drawEditor()
+		a.jump(a.s.row, a.s.col)
 	case tcell.KeyCtrlC:
 		if selection := a.s.Selection(); selection != nil {
 			line := a.s.line(selection.startRow)
