@@ -63,6 +63,8 @@ type Tab struct {
 	undoStack    []Edit
 	redoStack    []Edit
 	lastEdit     *Edit
+	backStack    []int
+	forwardStack []int
 }
 
 type Selection struct {
@@ -317,7 +319,7 @@ func (a *App) drawEditorLine(row int, line string) {
 	}
 
 	// selection highlight
-	if sel := a.s.Selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
+	if sel := a.s.selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
 		start, end := 0, len(screenLine)
 		if sel.startRow == row {
 			start = columnToScreen(line, sel.startCol)
@@ -483,22 +485,19 @@ func main() {
 				}
 				if ev.Key() == tcell.KeyCtrlO {
 					app.s.focus = focusConsole
-					app.setStatus("open file (:<line> or @symbol)")
-					app.setConsole("")
+					app.setConsole("", "filename")
 					app.syncCursor()
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlG {
 					app.s.focus = focusConsole
-					app.setStatus("go to line number")
-					app.setConsole(":")
+					app.setConsole(":", "line number")
 					app.syncCursor()
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlR {
 					app.s.focus = focusConsole
-					app.setStatus("go to symbol")
-					app.setConsole("@")
+					app.setConsole("@", "symbol")
 					app.syncCursor()
 
 					if len(app.s.tabs) == 0 {
@@ -527,16 +526,25 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlF {
+					var selected string
+					if sel := app.s.selected(); sel != nil && sel.startRow == sel.endRow {
+						line := app.s.line(sel.startRow)
+						if line != nil {
+							selected = line.Value.(string)[sel.startCol:sel.endCol]
+						}
+					}
+					if selected != "" {
+						app.setConsole("#" + selected)
+					} else {
+						app.setConsole("#", "find")
+					}
 					app.s.focus = focusConsole
-					app.setStatus("search text")
-					app.setConsole("#")
 					app.syncCursor()
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlP {
 					app.s.focus = focusConsole
-					app.setStatus("command:")
-					app.setConsole(">")
+					app.setConsole(">", "command")
 					app.syncCursor()
 					continue
 				}
@@ -639,8 +647,7 @@ func (a *App) handleClick(x, y int) {
 			// Open label
 			if x < specialLabelsStart+len(labelNew)+len(labelOpen) {
 				a.s.focus = focusConsole
-				a.setStatus("open file")
-				a.setConsole("")
+				a.setConsole("", "filename")
 				a.syncCursor()
 				return
 			}
@@ -702,8 +709,12 @@ func (a *App) handleClick(x, y int) {
 
 	if a.console.contains(x, y) {
 		a.s.focus = focusConsole
-		a.setConsole("")
+		// a.setConsole("")
 		a.syncCursor()
+		return
+	}
+
+	if a.status.contains(x, y) {
 		return
 	}
 
@@ -712,12 +723,15 @@ func (a *App) handleClick(x, y int) {
 		a.s.row = 0
 		a.s.col = 0
 	} else {
-		a.s.row = min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
+		row := min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
 		line := a.s.line(a.s.row).Value.(string)
 
 		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
 		// Convert screen position back to original line position
-		a.s.col = min(len(line), columnFromScreen(line, screenCol))
+		col := min(len(line), columnFromScreen(line, screenCol))
+		a.recordPositon(a.s.row, a.s.col)
+		a.s.row = row
+		a.s.col = col
 	}
 
 	if !a.s.selecting {
@@ -752,10 +766,14 @@ func (a *App) setStatus(s string) {
 }
 
 // setConsole updates the console view with the given string.
-func (a *App) setConsole(s string) {
+func (a *App) setConsole(s string, hint ...string) {
 	a.s.console = s
 	a.s.consoleCursor = len(s)
-	a.console.draw(s)
+	if len(hint) == 0 {
+		a.console.draw(s)
+	} else {
+		a.console.drawText(textStyle{text: s}, textStyle{text: hint[0], style: styleComment})
+	}
 }
 
 // jump moves the cursor to the specified line and column,
@@ -810,9 +828,9 @@ func (a *App) jump(row, col int) {
 		scroll = true
 	}
 
+	a.syncCursor()
 	if scroll {
 		a.drawEditor()
-		a.syncCursor()
 	}
 }
 
@@ -835,6 +853,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		// go to symbol
 		if a.s.console[0] == '@' && len(a.s.matchSymbols) > 0 {
 			matched := a.s.matchSymbols[a.s.matchIdx]
+			a.recordPositon(a.s.row, a.s.col)
 			a.jump(matched.Line-1, matched.Column-1)
 			a.s.focus = focusEditor
 			a.s.console = ""
@@ -897,6 +916,19 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 		}
 		a.status.drawText(ts...)
+	case tcell.KeyCtrlUnderscore:
+		// go to previous found keyword
+		if strings.Index(a.s.console, "#") == 0 {
+			a.goBack()
+			keyword := a.s.console[1:]
+			a.s.selection = &Selection{
+				startRow: a.s.row,
+				endRow:   a.s.row,
+				startCol: a.s.col - len(keyword),
+				endCol:   a.s.col,
+			}
+			a.drawEditor()
+		}
 	default:
 		return
 	}
@@ -937,7 +969,7 @@ func (st *State) closeTab(index int) {
 // - <filename> open file
 // - :<line_number> go to line
 // - @<symbol> go to symbol
-// - #<text> search text
+// - #<text> find text
 // - ><command>
 func (a *App) handleCommand(cmd string) {
 	// this function is called outside the main goroutine,
@@ -950,8 +982,7 @@ func (a *App) handleCommand(cmd string) {
 		switch c[0] {
 		case "save":
 			if len(c) == 1 || len(c[1]) == 0 {
-				a.setStatus("Usage: >save <filename>")
-				a.setConsole(">save ")
+				a.setConsole(">save ", "filename")
 				a.s.focus = focusConsole
 				a.syncCursor()
 				return
@@ -980,17 +1011,21 @@ func (a *App) handleCommand(cmd string) {
 			// toogle line number display
 			a.s.lineNumber = !a.s.lineNumber
 			// horizonal scroll may changed, update the cursor
+			a.s.focus = focusEditor
 			a.jump(a.s.row, a.s.col)
-			a.s.focus = focusEditor
-			a.draw()
 		case "bottom":
-			a.jump(-1, -1)
 			a.s.focus = focusEditor
-			a.draw()
+			a.jump(-1, -1)
+		case "back":
+			a.s.focus = focusEditor
+			a.goBack()
+		case "forward":
+			a.s.focus = focusEditor
+			a.goForward()
 		default:
 			a.setStatus("unknown command: " + cmd)
 		}
-	case ':':
+	case ':': // go to line
 		line, err := strconv.Atoi(cmd[1:])
 		if err != nil {
 			a.setStatus("Invalid line number")
@@ -1000,14 +1035,12 @@ func (a *App) handleCommand(cmd string) {
 			a.setStatus("Line number out of range")
 			return
 		}
-		a.jump(line-1, 0)
 		a.s.focus = focusEditor
-		a.draw()
-	case '@':
+		a.jump(line-1, 0)
+	case '@': // go to symbol
 		symbolStr := cmd[1:]
 		if symbolStr == "" {
 			a.s.matchSymbols = nil
-			a.setStatus("Usage: @symbol")
 			return
 		}
 		var matched []Symbol
@@ -1052,10 +1085,9 @@ func (a *App) handleCommand(cmd string) {
 			}
 		}
 		a.status.drawText(ts...)
-	case '#':
+	case '#': // find
 		text := cmd[1:]
 		if text == "" {
-			a.setStatus("Usage: #text")
 			return
 		}
 		row := a.s.row
@@ -1064,7 +1096,7 @@ func (a *App) handleCommand(cmd string) {
 		start := a.s.line(row)
 		for e := start; ; e = e.Next() {
 			if e == nil {
-				// reverse search
+				// reverse
 				e = a.s.lines.Front()
 				row = 0
 				col = 0
@@ -1078,6 +1110,7 @@ func (a *App) handleCommand(cmd string) {
 			}
 			line := e.Value.(string)
 			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(text)); i >= 0 {
+				a.recordPositon(a.s.row, a.s.col)
 				a.jump(row, col+i+len(text))
 				a.s.selection = &Selection{startRow: row, endRow: row, startCol: col + i, endCol: col + i + len(text)}
 				a.setConsole(cmd) // incremental search
@@ -1201,9 +1234,9 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		if selection := a.s.Selected(); selection != nil {
+		if sel := a.s.selected(); sel != nil {
 			// Delete the selected text
-			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
 
 			// Insert the new rune
@@ -1214,13 +1247,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col += len(newText)
 
 			a.s.recordEdit(Edit{
-				row:     selection.startRow,
-				col:     selection.startCol,
+				row:     sel.startRow,
+				col:     sel.startCol,
 				oldText: deletedText,
 				newText: newText,
 				kind:    editReplace,
 			})
-			if selection.startRow != selection.endRow {
+			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else {
 				a.drawEditorLine(a.s.row, line)
@@ -1261,17 +1294,17 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.jump(a.s.row, a.s.col)
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		// Handle selection deletion
-		if selection := a.s.Selected(); selection != nil {
-			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+		// Handle sel deletion
+		if sel := a.s.selected(); sel != nil {
+			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
 			a.s.recordEdit(Edit{
-				row:     selection.startRow,
-				col:     selection.startCol,
+				row:     sel.startRow,
+				col:     sel.startCol,
 				oldText: deletedText,
 				kind:    editDelete,
 			})
-			if selection.startRow != selection.endRow {
+			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
 				a.drawEditorLine(a.s.row, line.Value.(string))
@@ -1316,7 +1349,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
 		// move cursor to the start of the selection
-		if selection := a.s.Selected(); selection != nil {
+		if selection := a.s.selected(); selection != nil {
 			a.s.row = selection.startRow
 			a.s.col = selection.startCol
 			a.unselect()
@@ -1353,7 +1386,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyRight:
 		a.s.lastEdit = nil
 		// move cursor to the end of the selection
-		if selection := a.s.Selected(); selection != nil {
+		if selection := a.s.selected(); selection != nil {
 			a.s.row = selection.endRow
 			a.s.col = selection.endCol
 			a.unselect()
@@ -1486,21 +1519,21 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.jump(a.s.row, a.s.col)
 	case tcell.KeyCtrlC:
-		if selection := a.s.Selected(); selection != nil {
-			line := a.s.line(selection.startRow)
+		if sel := a.s.selected(); sel != nil {
+			line := a.s.line(sel.startRow)
 			var s strings.Builder
-			if selection.startRow == selection.endRow {
+			if sel.startRow == sel.endRow {
 				// Single line selection
-				s.WriteString(line.Value.(string)[selection.startCol:selection.endCol])
+				s.WriteString(line.Value.(string)[sel.startCol:sel.endCol])
 			} else {
-				for i := selection.startRow; i <= selection.endRow && line != nil; i++ {
+				for i := sel.startRow; i <= sel.endRow && line != nil; i++ {
 					text := line.Value.(string)
 					switch i {
-					case selection.startRow:
-						s.WriteString(text[selection.startCol:])
+					case sel.startRow:
+						s.WriteString(text[sel.startCol:])
 						s.WriteString("\n")
-					case selection.endRow:
-						s.WriteString(text[:selection.endCol])
+					case sel.endRow:
+						s.WriteString(text[:sel.endCol])
 					default:
 						s.WriteString(text)
 						s.WriteString("\n")
@@ -1523,18 +1556,18 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.s.clipboard = text
 	case tcell.KeyCtrlX:
-		if selection := a.s.Selected(); selection != nil {
+		if sel := a.s.selected(); sel != nil {
 			// Cut the selected text
-			deletedText := a.s.deleteRange(selection.startRow, selection.startCol, selection.endRow, selection.endCol)
+			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
 			a.s.recordEdit(Edit{
-				row:     selection.startRow,
-				col:     selection.startCol,
+				row:     sel.startRow,
+				col:     sel.startCol,
 				oldText: deletedText,
 				kind:    editDelete,
 			})
 			a.s.clipboard = deletedText
-			if selection.startRow != selection.endRow {
+			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
 				a.drawEditorLine(a.s.row, line.Value.(string))
@@ -1564,7 +1597,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if a.s.clipboard == "" {
 			return
 		}
-		if sel := a.s.Selected(); sel != nil {
+		if sel := a.s.selected(); sel != nil {
 			deleted := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
 			a.s.insertAt(a.s.clipboard, sel.startRow, sel.startCol)
@@ -1586,7 +1619,39 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			})
 		}
 		a.drawEditor()
+	case tcell.KeyCtrlUnderscore: // does not work in kitty
+		log.Print(a.s.backStack)
+		a.goBack()
+	case tcell.KeyEscape:
+		a.s.selection = nil
+		a.drawEditor()
 	}
+}
+
+// recordPositon record the cursor position.
+// Do not make it into method App.jump, for not every jump worth going back
+func (a *App) recordPositon(row, col int) {
+	a.s.backStack = append(a.s.backStack, row, col)
+	// clear forward stack on new jump
+	a.s.forwardStack = nil
+}
+
+func (a *App) goBack() {
+	if len(a.s.backStack) < 2 {
+		return
+	}
+	a.s.forwardStack = append(a.s.forwardStack, a.s.row, a.s.col)
+	a.jump(a.s.backStack[len(a.s.backStack)-2], a.s.backStack[len(a.s.backStack)-1])
+	a.s.backStack = a.s.backStack[:len(a.s.backStack)-2]
+}
+
+func (a *App) goForward() {
+	if len(a.s.forwardStack) < 2 {
+		return
+	}
+	a.s.backStack = append(a.s.backStack, a.s.row, a.s.col)
+	a.jump(a.s.forwardStack[len(a.s.forwardStack)-2], a.s.forwardStack[len(a.s.forwardStack)-1])
+	a.s.forwardStack = a.s.forwardStack[:len(a.s.forwardStack)-2]
 }
 
 // insertAt inserts a string at a specific position in the editor.
@@ -1634,7 +1699,7 @@ func (st *State) insertAt(s string, row, col int) {
 
 // unselect cancel the selection and redraws the affected lines.
 func (a *App) unselect() {
-	selection := a.s.Selected()
+	selection := a.s.selected()
 	if selection == nil {
 		return
 	}
@@ -1647,11 +1712,10 @@ func (a *App) unselect() {
 	}
 }
 
-// Selected returns a copy of the current selection,
+// selected returns a copy of the current selection,
 // ensuring it is in a consistent order.
 // It returns nil if no avaiable selection exists.
-// TODO: do this on mouse button release?
-func (st *State) Selected() *Selection {
+func (st *State) selected() *Selection {
 	if st.selection == nil {
 		return nil
 	}
