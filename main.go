@@ -43,6 +43,7 @@ type State struct {
 	consoleCursor int    // Cursor position in the console
 	focus         int    // Current focus (editor or console)
 	lineNumber    bool   // Whether to show line numbers in the editor
+	clipboard     string
 }
 
 type Tab struct {
@@ -50,8 +51,8 @@ type Tab struct {
 	lines        *list.List
 	row          int                 // Current row position (starts from 0)
 	col          int                 // Current column position (starts from 0)
-	top          int                 // vertical scroll position for the editor (starts from 0)
-	left         int                 // horizontal scroll position on screen (starts from 0)
+	top          int                 // vertical scroll  (starts from 0)
+	left         int                 // horizontal scroll  (starts from 0)
 	upDownCol    int                 // Column to maintain while navigating up/down
 	symbols      map[string][]Symbol // symbol name to list of symbols
 	matchSymbols []Symbol
@@ -960,6 +961,12 @@ func (a *App) handleCommand(cmd string) {
 			for e := a.s.lines.Front(); e != nil; e = e.Next() {
 				content = append(content, e.Value.(string))
 			}
+			// append newline at end of file
+			if len(content) == 0 || content[len(content)-1] != "" {
+				content = append(content, "")
+				a.s.lines.PushBack("")
+				a.drawEditor()
+			}
 			err := os.WriteFile(filename, []byte(strings.Join(content, "\n")), 0644)
 			if err != nil {
 				log.Printf("Failed to save file %s: %v", filename, err)
@@ -974,6 +981,10 @@ func (a *App) handleCommand(cmd string) {
 			a.s.lineNumber = !a.s.lineNumber
 			// horizonal scroll may changed, update the cursor
 			a.jump(a.s.row, a.s.col)
+			a.s.focus = focusEditor
+			a.draw()
+		case "bottom":
+			a.jump(-1, -1)
 			a.s.focus = focusEditor
 			a.draw()
 		default:
@@ -1066,23 +1077,11 @@ func (a *App) handleCommand(cmd string) {
 				return
 			}
 			line := e.Value.(string)
-			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(text)); i > -1 {
-				a.s.row = row
-				a.s.col = col + i + len(text)
-				a.s.top = max(0, a.s.row-(len(a.editor)/2)) // viewport center
-				// incremental search
-				a.setConsole(cmd)
+			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(text)); i >= 0 {
+				a.jump(row, col+i+len(text))
+				a.s.selection = &Selection{startRow: row, endRow: row, startCol: col + i, endCol: col + i + len(text)}
+				a.setConsole(cmd) // incremental search
 				a.draw()
-				lineView := a.editor[a.s.row-a.s.top]
-				// highlight the found text with tab expansion
-				screenLine := expandTabs(line)
-				screenStart := columnToScreen(line, col+i)
-				screenEnd := columnToScreen(line, a.s.col)
-				lineView.drawText(
-					textStyle{text: screenLine[:screenStart]},
-					textStyle{text: screenLine[screenStart:screenEnd], style: styleHighlight},
-					textStyle{text: screenLine[screenEnd:]},
-				)
 				return
 			}
 			row++
@@ -1172,7 +1171,7 @@ func (a *App) syncCursor() {
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
-		a.setStatus(fmt.Sprintf("Line %d, Column %d, Top %d, Left %d", a.s.row+1, a.s.col+1, a.s.top+1, a.s.left+1))
+		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
 			a.s.upDownCol = -1
 		}
@@ -1509,7 +1508,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 					line = line.Next()
 				}
 			}
-			screen.SetClipboard([]byte(s.String()))
+			a.s.clipboard = s.String()
 			return
 		}
 
@@ -1522,7 +1521,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if text == "" {
 			return
 		}
-		screen.SetClipboard([]byte(text))
+		a.s.clipboard = text
 	case tcell.KeyCtrlX:
 		if selection := a.s.Selected(); selection != nil {
 			// Cut the selected text
@@ -1534,7 +1533,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				oldText: deletedText,
 				kind:    editDelete,
 			})
-			screen.SetClipboard([]byte(deletedText))
+			a.s.clipboard = deletedText
 			if selection.startRow != selection.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
@@ -1552,14 +1551,40 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if text == "" {
 			return
 		}
-		screen.SetClipboard([]byte(text))
 		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(text))
+		a.s.clipboard = deletedText
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
 			col:     0,
 			oldText: deletedText,
 			kind:    editDelete,
 		})
+		a.drawEditor()
+	case tcell.KeyCtrlV:
+		if a.s.clipboard == "" {
+			return
+		}
+		if sel := a.s.Selected(); sel != nil {
+			deleted := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
+			a.s.selection = nil
+			a.s.insertAt(a.s.clipboard, sel.startRow, sel.startCol)
+			a.s.recordEdit(Edit{
+				row:     sel.startRow,
+				col:     sel.endCol,
+				oldText: deleted,
+				newText: a.s.clipboard,
+				kind:    editReplace,
+			})
+		} else {
+			row, col := a.s.row, a.s.col
+			a.s.insertAt(a.s.clipboard, row, col)
+			a.s.recordEdit(Edit{
+				row:     row,
+				col:     col,
+				newText: a.s.clipboard,
+				kind:    editInsert,
+			})
+		}
 		a.drawEditor()
 	}
 }
@@ -1568,9 +1593,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 // If s contains multiple lines, it will be split and inserted accordingly.
 // It updates the cursor position to the end of the inserted text.
 func (st *State) insertAt(s string, row, col int) {
+	if s == "" {
+		return
+	}
+
 	e := st.line(row)
 	if e == nil {
-		return
+		e = st.lines.PushBack("")
 	}
 
 	lines := strings.Split(s, "\n")
