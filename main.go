@@ -44,6 +44,9 @@ type State struct {
 	focus         int    // Current focus (editor or console)
 	lineNumber    bool   // Whether to show line numbers in the editor
 	clipboard     string
+	files         []string // top level file names
+	options       []string // options listed in the status bar
+	optionIdx     int      // current option index
 }
 
 type Tab struct {
@@ -55,8 +58,6 @@ type Tab struct {
 	left         int                 // horizontal scroll  (starts from 0)
 	upDownCol    int                 // Column to maintain while navigating up/down
 	symbols      map[string][]Symbol // symbol name to list of symbols
-	matchSymbols []Symbol
-	matchIdx     int
 	completion   string
 	selecting    bool
 	selection    *Selection
@@ -484,8 +485,28 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlO {
+					entries, err := os.ReadDir(".")
+					if err != nil {
+						log.Print(err)
+						continue
+					}
+					app.s.files = nil
+					for _, entry := range entries {
+						if !entry.IsDir() {
+							app.s.files = append(app.s.files, entry.Name())
+						}
+					}
+					app.s.options = app.s.files
+					app.s.optionIdx = 0
+					ts := make([]textStyle, 0, len(app.s.options))
+					for _, option := range app.s.options {
+						ts = append(ts, textStyle{text: option + " "})
+					}
+					ts[app.s.optionIdx].style = styleHighlight
+					app.status.drawText(ts...)
+
 					app.s.focus = focusConsole
-					app.setConsole("", "filename")
+					app.setConsole("", "search file by name")
 					app.syncCursor()
 					continue
 				}
@@ -521,8 +542,8 @@ func main() {
 						continue
 					}
 					app.s.symbols = symbols
-					app.s.matchSymbols = nil
-					app.s.matchIdx = 0
+					app.s.options = nil
+					app.s.optionIdx = 0
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlF {
@@ -724,8 +745,7 @@ func (a *App) handleClick(x, y int) {
 		a.s.col = 0
 	} else {
 		row := min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
-		line := a.s.line(a.s.row).Value.(string)
-
+		line := a.s.line(row).Value.(string)
 		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
 		// Convert screen position back to original line position
 		col := min(len(line), columnFromScreen(line, screenCol))
@@ -749,8 +769,8 @@ func (a *App) handleClick(x, y int) {
 	}
 
 	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
-	a.syncCursor()
 	a.drawEditor()
+	a.syncCursor()
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
 	if line := a.s.line(a.s.row); line != nil {
@@ -828,13 +848,17 @@ func (a *App) jump(row, col int) {
 		scroll = true
 	}
 
-	a.syncCursor()
 	if scroll {
 		a.drawEditor()
 	}
+	a.syncCursor()
 }
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
+	defer func() {
+		a.console.draw(a.s.console)
+		a.syncCursor()
+	}()
 	switch ev.Key() {
 	case tcell.KeyEscape:
 		// exit console
@@ -847,31 +871,20 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			a.drawEditorLine(a.s.row, line.Value.(string))
 		}
 	case tcell.KeyEnter:
-		if a.s.console == "" {
-			return
+		if len(a.s.options) > 0 {
+			if a.s.console != "" && a.s.console[0] == '@' {
+				a.s.console = a.s.console[:1] + a.s.options[a.s.optionIdx]
+			} else {
+				a.s.console = a.s.options[a.s.optionIdx]
+			}
+			a.s.options = nil
 		}
-		// go to symbol
-		if a.s.console[0] == '@' && len(a.s.matchSymbols) > 0 {
-			matched := a.s.matchSymbols[a.s.matchIdx]
-			a.recordPositon(a.s.row, a.s.col)
-			a.jump(matched.Line-1, matched.Column-1)
-			a.s.focus = focusEditor
-			a.s.console = ""
-			a.draw()
+		if a.s.console == "" {
 			return
 		}
 		a.cmdCh <- strings.TrimSpace(a.s.console)
 		a.s.console = ""
 		a.s.consoleCursor = 0
-	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if a.s.console == "" {
-			return
-		}
-		a.s.console = a.s.console[:a.s.consoleCursor-1] + a.s.console[a.s.consoleCursor:]
-		a.s.consoleCursor--
-		if a.s.console != "" && a.s.console[0] == '@' {
-			a.cmdCh <- a.s.console
-		}
 	case tcell.KeyLeft:
 		if a.s.console == "" {
 			return
@@ -882,39 +895,109 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			return
 		}
 		a.s.consoleCursor++
-	case tcell.KeyRune:
-		if a.s.consoleCursor >= len(a.s.console) {
-			a.s.console += string(ev.Rune())
-		} else {
-			a.s.console = a.s.console[:a.s.consoleCursor] + string(ev.Rune()) + a.s.console[a.s.consoleCursor:]
+	case tcell.KeyRune, tcell.KeyBackspace, tcell.KeyBackspace2:
+		if ev.Key() == tcell.KeyRune {
+			rs := []rune(a.s.console)
+			rs = slices.Insert(rs, a.s.consoleCursor, ev.Rune())
+			a.s.console = string(rs)
+			a.s.consoleCursor++
+		} else { // backspace
+			if a.s.console == "" {
+				return
+			}
+			a.s.console = a.s.console[:a.s.consoleCursor-1] + a.s.console[a.s.consoleCursor:]
+			a.s.consoleCursor--
+			if a.s.console == "" {
+				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+				return
+			}
 		}
-		a.s.consoleCursor++
-		// incremental command handling
-		if len(a.s.console) >= 2 && a.s.console[0] == '@' {
-			a.cmdCh <- a.s.console
+
+		switch a.s.console[0] {
+		case '>', '#', ':':
+			return
+		case '@': // filter symbol
+			keyword := a.s.console[1:]
+			if keyword == "" {
+				return
+			}
+			var filter []string
+			for _, v := range a.s.symbols {
+				for _, sym := range v {
+					name := sym.Name
+					if sym.Receiver != "" {
+						name = sym.Receiver + "." + sym.Name
+					}
+					if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
+						filter = append(filter, name)
+					}
+				}
+			}
+			slices.Sort(filter)
+			j := 0
+			for i := range filter {
+				if strings.Index(strings.ToLower(filter[i]), strings.ToLower(keyword)) == 0 {
+					// move the relevant forward
+					filter[i], filter[j] = filter[j], filter[i]
+					j++
+				}
+			}
+			a.s.options = filter
+			a.s.optionIdx = 0
+			if len(a.s.options) == 0 {
+				return
+			}
+			ts := make([]textStyle, 0, len(a.s.options))
+			for _, option := range a.s.options {
+				ts = append(ts, textStyle{text: option + " "})
+			}
+			ts[a.s.optionIdx].style = styleHighlight
+			a.status.drawText(ts...)
+		default: // filter file name
+			if len(a.s.files) == 0 {
+				return
+			}
+			keyword := a.s.console
+			var filter []string
+			for _, name := range a.s.files {
+				if strings.Contains(name, keyword) {
+					filter = append(filter, name)
+				}
+			}
+			j := 0
+			for i := range filter {
+				if strings.Index(filter[i], keyword) == 0 {
+					// move the relevant forward
+					filter[i], filter[j] = filter[j], filter[i]
+					j++
+				}
+			}
+			a.s.options = filter
+			a.s.optionIdx = 0
+			if len(a.s.options) == 0 {
+				return
+			}
+			ts := make([]textStyle, 0, len(a.s.options))
+			for _, option := range a.s.options {
+				ts = append(ts, textStyle{text: option + " "})
+			}
+			ts[a.s.optionIdx].style = styleHighlight
+			a.status.drawText(ts...)
 		}
 	case tcell.KeyTAB, tcell.KeyBacktab:
-		if len(a.s.matchSymbols) == 0 {
+		if len(a.s.options) <= 0 {
 			return
 		}
-		// select symbol in the match list
 		if ev.Key() == tcell.KeyTAB {
-			a.s.matchIdx = (a.s.matchIdx + 1) % len(a.s.matchSymbols)
+			a.s.optionIdx = (a.s.optionIdx + 1) % len(a.s.options)
 		} else {
-			a.s.matchIdx = (a.s.matchIdx - 1 + len(a.s.matchSymbols)) % len(a.s.matchSymbols)
+			a.s.optionIdx = (a.s.optionIdx - 1 + len(a.s.options)) % len(a.s.options)
 		}
-		ts := make([]textStyle, len(a.s.matchSymbols))
-		for i, sym := range a.s.matchSymbols {
-			text := sym.Name + " "
-			if sym.Receiver != "" {
-				text = sym.Receiver + "." + sym.Name + " "
-			}
-			if i == a.s.matchIdx {
-				ts[i] = textStyle{text: text, style: styleHighlight}
-			} else {
-				ts[i] = textStyle{text: text}
-			}
+		ts := make([]textStyle, 0, len(a.s.options))
+		for _, option := range a.s.options {
+			ts = append(ts, textStyle{text: option + " "})
 		}
+		ts[a.s.optionIdx].style = styleHighlight
 		a.status.drawText(ts...)
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
@@ -929,10 +1012,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			a.drawEditor()
 		}
-	default:
-		return
 	}
-	a.console.draw(a.s.console)
 }
 
 // closeTab closes the tab at the specified index and adjusts the current tab selection.
@@ -1013,6 +1093,7 @@ func (a *App) handleCommand(cmd string) {
 			// horizonal scroll may changed, update the cursor
 			a.s.focus = focusEditor
 			a.jump(a.s.row, a.s.col)
+			a.drawEditor()
 		case "bottom":
 			a.s.focus = focusEditor
 			a.jump(-1, -1)
@@ -1038,53 +1119,23 @@ func (a *App) handleCommand(cmd string) {
 		a.s.focus = focusEditor
 		a.jump(line-1, 0)
 	case '@': // go to symbol
-		symbolStr := cmd[1:]
-		if symbolStr == "" {
-			a.s.matchSymbols = nil
-			return
+		name := cmd[1:]
+		var receiver string
+		if i := strings.Index(name, "."); i >= 0 {
+			receiver = name[:i]
+			name = name[i+1:]
 		}
-		var matched []Symbol
-		for _, v := range a.s.symbols {
-			for _, sym := range v {
-				name := sym.Name
-				if sym.Receiver != "" {
-					name = sym.Receiver + "." + sym.Name
-				}
-				if strings.Contains(strings.ToLower(name), strings.ToLower(symbolStr)) {
-					matched = append(matched, sym)
-				}
+		var matched Symbol
+		for _, symbol := range a.s.symbols[name] {
+			if symbol.Receiver == receiver {
+				matched = symbol
 			}
 		}
-		slices.SortFunc(matched, func(a, b Symbol) int {
-			nameA := a.Name
-			nameB := b.Name
-			if a.Receiver != "" {
-				nameA = a.Receiver + "." + a.Name
-			}
-			if b.Receiver != "" {
-				nameB = b.Receiver + "." + b.Name
-			}
-			return strings.Compare(nameA, nameB)
-		})
-		a.s.matchSymbols = matched
-		a.s.matchIdx = 0
-		if len(matched) == 0 {
-			a.setStatus("no matching symbols")
-			return
-		}
-		ts := make([]textStyle, len(matched))
-		for i, sym := range matched {
-			text := sym.Name + " "
-			if sym.Receiver != "" {
-				text = sym.Receiver + "." + sym.Name + " "
-			}
-			if i == a.s.matchIdx {
-				ts[i] = textStyle{text: text, style: styleHighlight}
-			} else {
-				ts[i] = textStyle{text: text}
-			}
-		}
-		a.status.drawText(ts...)
+		a.recordPositon(a.s.row, a.s.col)
+		a.jump(matched.Line-1, matched.Column-1)
+		a.s.focus = focusEditor
+		a.s.console = ""
+		a.draw()
 	case '#': // find
 		text := cmd[1:]
 		if text == "" {
@@ -1174,6 +1225,8 @@ func (a *App) commandLoop() {
 	}
 }
 
+// syncCursor sync cursor position and show it.
+// when rendering line highlight, call this method after editor redraw.
 func (a *App) syncCursor() {
 	switch a.s.focus {
 	case focusEditor:
@@ -1193,7 +1246,20 @@ func (a *App) syncCursor() {
 
 		line := lineElement.Value.(string)
 		screenCol := columnToScreen(line, a.s.col) - a.s.left
-		screen.ShowCursor(a.editor[0].x+a.s.lineNumLen()+screenCol, a.editor[0].y+a.s.row-a.s.top)
+		x := a.editor[0].x + a.s.lineNumLen() + screenCol
+		y := a.editor[0].y + a.s.row - a.s.top
+		screen.ShowCursor(x, y)
+
+		if sel := a.s.selected(); sel != nil && sel.startRow <= a.s.row && a.s.row <= sel.endRow {
+			// selection highlighted
+			return
+		}
+		// render current line highlight
+		w, _ := screen.Size()
+		for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
+			r, _, style, _ := screen.GetContent(x, y)
+			screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
+		}
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
 	default:
@@ -1620,7 +1686,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.drawEditor()
 	case tcell.KeyCtrlUnderscore: // does not work in kitty
-		log.Print(a.s.backStack)
 		a.goBack()
 	case tcell.KeyEscape:
 		a.s.selection = nil
@@ -2027,7 +2092,7 @@ func highlightGoLine(line string) []textStyle {
 			} else if _, err := strconv.Atoi(w); err == nil {
 				parts = append(parts, textStyle{text: w, style: styleNumber})
 			} else {
-				parts = append(parts, textStyle{text: w})
+				parts = append(parts, textStyle{text: w, style: styleBase})
 			}
 			word.Reset()
 		}
@@ -2068,7 +2133,7 @@ func highlightGoLine(line string) []textStyle {
 			word.WriteRune(c)
 		} else {
 			flushWord()
-			parts = append(parts, textStyle{text: string(c)})
+			parts = append(parts, textStyle{text: string(c), style: styleBase})
 		}
 	}
 
