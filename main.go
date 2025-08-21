@@ -343,7 +343,7 @@ func (a *App) drawEditorLine(row int, line string) {
 	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 		a.editor[row-a.s.top].drawText(
 			textStyle{text: lineNumber, style: styleComment},
-			textStyle{text: screenLine},
+			textStyle{text: screenLine, style: styleBase},
 		)
 		return
 	}
@@ -1225,6 +1225,8 @@ func (a *App) commandLoop() {
 	}
 }
 
+var prevHighlightLine int
+
 // syncCursor sync cursor position and show it.
 // when rendering line highlight, call this method after editor redraw.
 func (a *App) syncCursor() {
@@ -1251,14 +1253,23 @@ func (a *App) syncCursor() {
 		screen.ShowCursor(x, y)
 
 		if sel := a.s.selected(); sel != nil && sel.startRow <= a.s.row && a.s.row <= sel.endRow {
-			// selection highlighted
+			// selection highlighted, no more line highlight
 			return
 		}
-		// render current line highlight
-		w, _ := screen.Size()
-		for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
-			r, _, style, _ := screen.GetContent(x, y)
-			screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
+		if a.s.row != prevHighlightLine {
+			// clear previous line
+			w, _ := screen.Size()
+			prevY := a.editor[0].y + prevHighlightLine - a.s.top
+			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
+				r, _, style, _ := screen.GetContent(x, prevY)
+				screen.SetContent(x, prevY, r, nil, style.Background(tcell.ColorWhite))
+			}
+			prevHighlightLine = a.s.row
+			// render current line
+			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
+				r, _, style, _ := screen.GetContent(x, y)
+				screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
+			}
 		}
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
