@@ -497,16 +497,15 @@ func main() {
 						}
 					}
 					app.s.options = app.s.files
-					app.s.optionIdx = 0
+					app.s.optionIdx = -1 // no selected option by default
 					ts := make([]textStyle, 0, len(app.s.options))
 					for _, option := range app.s.options {
 						ts = append(ts, textStyle{text: option + " "})
 					}
-					ts[app.s.optionIdx].style = styleHighlight
 					app.status.drawText(ts...)
 
 					app.s.focus = focusConsole
-					app.setConsole("", "search file by name")
+					app.setConsole("", "file name")
 					app.syncCursor()
 					continue
 				}
@@ -522,11 +521,10 @@ func main() {
 					app.syncCursor()
 
 					if len(app.s.tabs) == 0 {
-						app.setStatus("Not a Go file, cannot parse symbols")
 						continue
 					}
 					if !strings.HasSuffix(app.s.filename, ".go") {
-						app.setStatus("Not a Go file, cannot parse symbols")
+						// Go symbols only
 						continue
 					}
 					var src strings.Builder
@@ -543,7 +541,7 @@ func main() {
 					}
 					app.s.symbols = symbols
 					app.s.options = nil
-					app.s.optionIdx = 0
+					app.s.optionIdx = -1
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlF {
@@ -871,18 +869,34 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			a.drawEditorLine(a.s.row, line.Value.(string))
 		}
 	case tcell.KeyEnter:
-		if len(a.s.options) > 0 {
-			if a.s.console != "" && a.s.console[0] == '@' {
-				a.s.console = a.s.console[:1] + a.s.options[a.s.optionIdx]
-			} else {
-				a.s.console = a.s.options[a.s.optionIdx]
-			}
-			a.s.options = nil
-		}
-		if a.s.console == "" {
+		cmd := strings.TrimSpace(a.s.console)
+		if cmd == "#" || cmd == ":" || cmd == ">" {
+			a.s.console = ""
+			a.s.focus = focusEditor
+			a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 			return
 		}
-		a.cmdCh <- strings.TrimSpace(a.s.console)
+		if cmd == "" || cmd[0] != '@' {
+			// search file
+			if len(a.s.options) == 0 || a.s.optionIdx < 0 {
+				a.s.console = ""
+				a.s.focus = focusEditor
+				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+				return
+			}
+			cmd = a.s.options[a.s.optionIdx]
+		} else {
+			// search symbol
+			if len(a.s.options) == 0 || a.s.optionIdx < 0 {
+				a.s.console = ""
+				a.s.focus = focusEditor
+				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+				return
+			}
+			cmd = "@" + a.s.options[a.s.optionIdx]
+		}
+
+		a.cmdCh <- cmd
 		a.s.console = ""
 		a.s.consoleCursor = 0
 	case tcell.KeyLeft:
@@ -895,28 +909,98 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			return
 		}
 		a.s.consoleCursor++
-	case tcell.KeyRune, tcell.KeyBackspace, tcell.KeyBackspace2:
-		if ev.Key() == tcell.KeyRune {
-			rs := []rune(a.s.console)
-			rs = slices.Insert(rs, a.s.consoleCursor, ev.Rune())
-			a.s.console = string(rs)
-			a.s.consoleCursor++
-		} else { // backspace
-			if a.s.console == "" {
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		if a.s.console == "" {
+			return
+		}
+		a.s.console = a.s.console[:a.s.consoleCursor-1] + a.s.console[a.s.consoleCursor:]
+		a.s.consoleCursor--
+		if a.s.console == "" {
+			a.s.options = a.s.files
+			a.s.optionIdx = -1
+		} else if char := a.s.console[0]; char == '#' || char == ':' || char == '>' {
+			return
+		} else if char == '@' {
+			keyword := a.s.console[1:]
+			if keyword == "" {
+				a.s.options = nil
+				a.status.draw("")
 				return
 			}
-			a.s.console = a.s.console[:a.s.consoleCursor-1] + a.s.console[a.s.consoleCursor:]
-			a.s.consoleCursor--
-			if a.s.console == "" {
-				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+			var filter []string
+			for _, v := range a.s.symbols {
+				for _, sym := range v {
+					name := sym.Name
+					if sym.Receiver != "" {
+						name = sym.Receiver + "." + sym.Name
+					}
+					if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
+						filter = append(filter, name)
+					}
+				}
+			}
+			if len(filter) == 0 {
+				a.s.options = nil
+				a.status.draw("")
 				return
+			}
+			slices.Sort(filter)
+			j := 0
+			for i := range filter {
+				if strings.Index(strings.ToLower(filter[i]), strings.ToLower(keyword)) == 0 {
+					// move the relevant forward
+					filter[i], filter[j] = filter[j], filter[i]
+					j++
+				}
+			}
+			a.s.options = filter
+			a.s.optionIdx = 0
+		} else {
+			// search file
+			if len(a.s.files) == 0 {
+				return
+			}
+			keyword := a.s.console
+			var filter []string
+			for _, name := range a.s.files {
+				if strings.Contains(name, keyword) {
+					filter = append(filter, name)
+				}
+			}
+			if len(filter) == 0 {
+				a.s.options = nil
+				a.status.draw("")
+				return
+			}
+			j := 0
+			for i := range filter {
+				if strings.Index(filter[i], keyword) == 0 {
+					// move the relevant forward
+					filter[i], filter[j] = filter[j], filter[i]
+					j++
+				}
+			}
+			a.s.options = filter
+			a.s.optionIdx = 0
+		}
+		ts := make([]textStyle, 0, len(a.s.options))
+		for i, option := range a.s.options {
+			if i == a.s.optionIdx {
+				ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+			} else {
+				ts = append(ts, textStyle{text: option + " "})
 			}
 		}
-
+		a.status.drawText(ts...)
+	case tcell.KeyRune:
+		rs := []rune(a.s.console)
+		rs = slices.Insert(rs, a.s.consoleCursor, ev.Rune())
+		a.s.console = string(rs)
+		a.s.consoleCursor++
 		switch a.s.console[0] {
 		case '>', '#', ':':
 			return
-		case '@': // filter symbol
+		case '@':
 			keyword := a.s.console[1:]
 			if keyword == "" {
 				return
@@ -933,6 +1017,11 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 					}
 				}
 			}
+			if len(filter) == 0 {
+				a.s.options = nil
+				a.status.draw("")
+				return
+			}
 			slices.Sort(filter)
 			j := 0
 			for i := range filter {
@@ -944,16 +1033,16 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			a.s.options = filter
 			a.s.optionIdx = 0
-			if len(a.s.options) == 0 {
-				return
-			}
 			ts := make([]textStyle, 0, len(a.s.options))
-			for _, option := range a.s.options {
-				ts = append(ts, textStyle{text: option + " "})
+			for i, option := range a.s.options {
+				if i == a.s.optionIdx {
+					ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+				} else {
+					ts = append(ts, textStyle{text: option + " "})
+				}
 			}
-			ts[a.s.optionIdx].style = styleHighlight
 			a.status.drawText(ts...)
-		default: // filter file name
+		default: // search file
 			if len(a.s.files) == 0 {
 				return
 			}
@@ -963,6 +1052,11 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 				if strings.Contains(name, keyword) {
 					filter = append(filter, name)
 				}
+			}
+			if len(filter) == 0 {
+				a.s.options = nil
+				a.status.draw("")
+				return
 			}
 			j := 0
 			for i := range filter {
@@ -974,14 +1068,14 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			a.s.options = filter
 			a.s.optionIdx = 0
-			if len(a.s.options) == 0 {
-				return
-			}
 			ts := make([]textStyle, 0, len(a.s.options))
-			for _, option := range a.s.options {
-				ts = append(ts, textStyle{text: option + " "})
+			for i, option := range a.s.options {
+				if i == a.s.optionIdx {
+					ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+				} else {
+					ts = append(ts, textStyle{text: option + " "})
+				}
 			}
-			ts[a.s.optionIdx].style = styleHighlight
 			a.status.drawText(ts...)
 		}
 	case tcell.KeyTAB, tcell.KeyBacktab:
@@ -1046,7 +1140,7 @@ func (st *State) closeTab(index int) {
 
 // handleCommand processes a command string and performs actions based on its prefix.
 // Commands:
-// - <filename> open file
+// - <filename> search file
 // - :<line_number> go to line
 // - @<symbol> go to symbol
 // - #<text> find text
