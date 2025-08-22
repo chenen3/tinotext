@@ -485,6 +485,7 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlO {
+					// keep it simple, don't read the folder recursively
 					entries, err := os.ReadDir(".")
 					if err != nil {
 						log.Print(err)
@@ -492,7 +493,7 @@ func main() {
 					}
 					app.s.files = nil
 					for _, entry := range entries {
-						if !entry.IsDir() {
+						if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
 							app.s.files = append(app.s.files, entry.Name())
 						}
 					}
@@ -963,7 +964,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			keyword := a.s.console
 			var filter []string
 			for _, name := range a.s.files {
-				if strings.Contains(name, keyword) {
+				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
 					filter = append(filter, name)
 				}
 			}
@@ -1049,7 +1050,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			keyword := a.s.console
 			var filter []string
 			for _, name := range a.s.files {
-				if strings.Contains(name, keyword) {
+				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
 					filter = append(filter, name)
 				}
 			}
