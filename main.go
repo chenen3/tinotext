@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -231,7 +232,8 @@ func columnFromScreen(line string, screenCol int) int {
 func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
-	a.status.draw(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+	//a.status.draw(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+	a.drawStatus()
 	a.console.draw(a.s.console)
 	a.syncCursor()
 }
@@ -248,7 +250,7 @@ func (a *App) drawTabs() {
 	var ts []textStyle
 	var totalTabWidth int
 	for i, tab := range a.s.tabs {
-		name := tab.filename
+		name := filepath.Base(tab.filename)
 		if name == "" {
 			name = "untitled"
 		}
@@ -269,6 +271,23 @@ func (a *App) drawTabs() {
 	}
 	ts = append(ts, textStyle{text: labels})
 	a.tab.drawText(ts...)
+}
+
+// drawStatus show filename, line and column number by default.
+// If msg is provided, show the message instead.
+func (a *App) drawStatus(msg ...string) {
+	if len(msg) == 0 {
+		lineCol := fmt.Sprintf("Line %d, Column %d ", a.s.row+1, a.s.col+1)
+		padding := max(0, a.status.w-len(a.s.filename)-len(lineCol))
+		a.status.drawText(
+			textStyle{text: a.s.filename},
+			textStyle{text: strings.Repeat(" ", padding)},
+			textStyle{text: lineCol},
+		)
+		return
+	}
+
+	a.status.draw(msg[0])
 }
 
 func (st *State) newLineNum(row int) string {
@@ -538,7 +557,7 @@ func main() {
 					}
 					symbols, err := ParseSymbol(app.s.filename, src.String())
 					if err != nil {
-						app.setStatus("Failed to parse symbols: " + err.Error())
+						app.drawStatus("Failed to parse symbols: " + err.Error())
 						continue
 					}
 					app.s.symbols = symbols
@@ -768,21 +787,10 @@ func (a *App) handleClick(x, y int) {
 		a.s.selection.endCol = a.s.col
 	}
 
-	a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+	a.drawStatus()
 	a.drawEditor()
 	a.syncCursor()
 	a.s.upDownCol = -1 // reset up/down column tracking
-	// debug
-	if line := a.s.line(a.s.row); line != nil {
-		log.Printf("Clicked line %d, column %d, text: %q", a.s.row+1, a.s.col+1,
-			line.Value.(string))
-	}
-}
-
-// setStatus updates the status view with the given string.
-func (a *App) setStatus(s string) {
-	a.s.status = s
-	a.status.draw(s)
 }
 
 // setConsole updates the console view with the given string.
@@ -862,7 +870,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 	exitConsole := func() {
 		a.s.console = ""
 		a.s.focus = focusEditor
-		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+		a.drawStatus()
 	}
 	switch ev.Key() {
 	case tcell.KeyEscape:
@@ -1177,7 +1185,7 @@ func (a *App) handleCommand(cmd string) {
 			file, err := os.Open(filename)
 			if err != nil {
 				log.Print(err)
-				a.setStatus(err.Error())
+				a.drawStatus(err.Error())
 				return
 			}
 			defer file.Close()
@@ -1188,7 +1196,7 @@ func (a *App) handleCommand(cmd string) {
 			}
 			if err := scanner.Err(); err != nil {
 				log.Print(err)
-				a.setStatus(err.Error())
+				a.drawStatus(err.Error())
 				return
 			}
 			a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: lines})
@@ -1217,9 +1225,9 @@ func (a *App) handleCommand(cmd string) {
 			err := os.WriteFile(filename, []byte(strings.Join(content, "\n")), 0644)
 			if err != nil {
 				log.Printf("Failed to save file %s: %v", filename, err)
-				a.setStatus("Failed to save file: " + err.Error())
+				a.drawStatus("Failed to save file: " + err.Error())
 			} else {
-				a.setStatus("File saved as: " + filename)
+				a.drawStatus("File saved as: " + filename)
 				a.s.filename = filename // update current tab
 				a.s.focus = focusEditor
 			}
@@ -1240,16 +1248,16 @@ func (a *App) handleCommand(cmd string) {
 			a.s.focus = focusEditor
 			a.goForward()
 		default:
-			a.setStatus("unknown command: " + cmd)
+			a.drawStatus("unknown command: " + cmd)
 		}
 	case ':': // go to line
 		line, err := strconv.Atoi(cmd[1:])
 		if err != nil {
-			a.setStatus("Invalid line number")
+			a.drawStatus("Invalid line number")
 			return
 		}
 		if line < 1 || line > a.s.lines.Len() {
-			a.setStatus("Line number out of range")
+			a.drawStatus("Line number out of range")
 			return
 		}
 		a.s.focus = focusEditor
@@ -1378,7 +1386,7 @@ func (a *App) syncCursor() {
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
-		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+		a.drawStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
 			a.s.upDownCol = -1
 		}
