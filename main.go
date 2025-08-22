@@ -484,6 +484,7 @@ func main() {
 					app.draw()
 					continue
 				}
+				// quickly open file in current folder
 				if ev.Key() == tcell.KeyCtrlO {
 					// keep it simple, don't read the folder recursively
 					entries, err := os.ReadDir(".")
@@ -667,7 +668,7 @@ func (a *App) handleClick(x, y int) {
 			// Open label
 			if x < specialLabelsStart+len(labelNew)+len(labelOpen) {
 				a.s.focus = focusConsole
-				a.setConsole("", "filename")
+				a.setConsole(">open ")
 				a.syncCursor()
 				return
 			}
@@ -858,48 +859,48 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.console.draw(a.s.console)
 		a.syncCursor()
 	}()
-	switch ev.Key() {
-	case tcell.KeyEscape:
-		// exit console
+	exitConsole := func() {
 		a.s.console = ""
-		a.s.consoleCursor = 0
 		a.s.focus = focusEditor
 		a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+	}
+	switch ev.Key() {
+	case tcell.KeyEscape:
+		exitConsole()
 		// reset matched text
 		if line := a.s.line(a.s.row); line != nil {
 			a.drawEditorLine(a.s.row, line.Value.(string))
 		}
 	case tcell.KeyEnter:
 		cmd := strings.TrimSpace(a.s.console)
-		if cmd == "#" || cmd == ":" || cmd == ">" {
-			a.s.console = ""
-			a.s.focus = focusEditor
-			a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+		if cmd == "" {
+			if len(a.s.options) > 0 && a.s.optionIdx >= 0 {
+				a.cmdCh <- ">open " + a.s.options[a.s.optionIdx]
+			}
+			exitConsole()
 			return
 		}
-		if cmd == "" || cmd[0] != '@' {
-			// search file
-			if len(a.s.options) == 0 || a.s.optionIdx < 0 {
-				a.s.console = ""
-				a.s.focus = focusEditor
-				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+		switch cmd[0] {
+		case '#', ':', '>':
+			if len(cmd[1:]) == 0 {
+				exitConsole()
 				return
 			}
-			cmd = a.s.options[a.s.optionIdx]
-		} else {
-			// search symbol
+		case '@':
 			if len(a.s.options) == 0 || a.s.optionIdx < 0 {
-				a.s.console = ""
-				a.s.focus = focusEditor
-				a.setStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
+				exitConsole()
 				return
 			}
 			cmd = "@" + a.s.options[a.s.optionIdx]
+		default:
+			if len(a.s.options) == 0 || a.s.optionIdx < 0 {
+				exitConsole()
+				return
+			}
+			cmd = ">open " + a.s.options[a.s.optionIdx]
 		}
-
-		a.cmdCh <- cmd
 		a.s.console = ""
-		a.s.consoleCursor = 0
+		a.cmdCh <- cmd
 	case tcell.KeyLeft:
 		if a.s.console == "" {
 			return
@@ -1141,7 +1142,6 @@ func (st *State) closeTab(index int) {
 
 // handleCommand processes a command string and performs actions based on its prefix.
 // Commands:
-// - <filename> search file
 // - :<line_number> go to line
 // - @<symbol> go to symbol
 // - #<text> find text
@@ -1155,6 +1155,47 @@ func (a *App) handleCommand(cmd string) {
 	case '>':
 		c := strings.Split(cmd[1:], " ")
 		switch c[0] {
+		case "open":
+			if len(c) == 1 || len(c[1]) == 0 {
+				return
+			}
+			filename := c[1]
+			i := -1
+			for j, tab := range a.s.tabs {
+				if tab.filename == filename {
+					i = j
+					break
+				}
+			}
+			if i >= 0 {
+				a.s.switchTab(i)
+				a.s.focus = focusEditor
+				a.draw()
+				return
+			}
+
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Print(err)
+				a.setStatus(err.Error())
+				return
+			}
+			defer file.Close()
+			lines := list.New()
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				lines.PushBack(scanner.Text())
+			}
+			if err := scanner.Err(); err != nil {
+				log.Print(err)
+				a.setStatus(err.Error())
+				return
+			}
+			a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: lines})
+			a.s.switchTab(len(a.s.tabs) - 1)
+			a.s.focus = focusEditor
+			a.draw()
+			return
 		case "save":
 			if len(c) == 1 || len(c[1]) == 0 {
 				a.setConsole(">save ", "filename")
@@ -1266,45 +1307,6 @@ func (a *App) handleCommand(cmd string) {
 			row++
 			col = 0
 		}
-	default:
-		// open file
-		filename := cmd
-		i := -1
-		for j, tab := range a.s.tabs {
-			if tab.filename == filename {
-				i = j
-				break
-			}
-		}
-		if i >= 0 {
-			a.s.switchTab(i)
-			a.s.focus = focusEditor
-			a.draw()
-			return
-		}
-
-		file, err := os.Open(filename)
-		if err != nil {
-			log.Print(err)
-			a.setStatus(err.Error())
-			return
-		}
-		defer file.Close()
-		lines := list.New()
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			lines.PushBack(scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			log.Print(err)
-			a.setStatus(err.Error())
-			return
-		}
-		a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: lines})
-		a.s.switchTab(len(a.s.tabs) - 1)
-		a.s.focus = focusEditor
-		a.draw()
-		return
 	}
 }
 
@@ -1351,20 +1353,20 @@ func (a *App) syncCursor() {
 			// selection highlighted, no more line highlight
 			return
 		}
+		// render current line
+		w, _ := screen.Size()
+		for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
+			r, _, style, _ := screen.GetContent(x, y)
+			screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
+		}
 		if a.s.row != prevHighlightLine {
 			// clear previous line
-			w, _ := screen.Size()
 			prevY := a.editor[0].y + prevHighlightLine - a.s.top
 			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
 				r, _, style, _ := screen.GetContent(x, prevY)
 				screen.SetContent(x, prevY, r, nil, style.Background(tcell.ColorWhite))
 			}
 			prevHighlightLine = a.s.row
-			// render current line
-			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
-				r, _, style, _ := screen.GetContent(x, y)
-				screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
-			}
 		}
 	case focusConsole:
 		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
