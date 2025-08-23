@@ -18,6 +18,7 @@ import (
 	"unicode"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -40,7 +41,7 @@ type State struct {
 	tabs          []*Tab
 	activeTabIdx  int
 	status        string // Status message displayed in the status bar
-	console       string // Console input text
+	console       []rune // Console input text
 	consoleCursor int    // Cursor position in the console
 	focus         int    // Current focus (editor or console)
 	lineNumber    bool   // Whether to show line numbers in the editor
@@ -52,7 +53,7 @@ type State struct {
 
 type Tab struct {
 	filename     string
-	lines        *list.List
+	lines        *list.List          // element value is []rune
 	row          int                 // Current row position (starts from 0)
 	col          int                 // Current column position (starts from 0)
 	top          int                 // vertical scroll  (starts from 0)
@@ -113,14 +114,17 @@ type View struct {
 
 // draw draws a line and clears the remaining space
 func (v *View) draw(line string) {
-	for row := range v.h {
-		for col := range v.w {
-			if col < len(line) {
-				screen.SetContent(v.x+col, v.y+row, rune(line[col]), nil, v.style)
-			} else {
-				screen.SetContent(v.x+col, v.y+row, ' ', nil, v.style)
-			}
+	col := 0
+	for _, c := range line {
+		if col >= v.w {
+			return
 		}
+		screen.SetContent(v.x+col, v.y, c, nil, v.style)
+		col += runewidth.RuneWidth(c)
+	}
+	// Clear remaining space
+	for i := col; i < v.w; i++ {
+		screen.SetContent(v.x+i, v.y, ' ', nil, v.style)
 	}
 }
 
@@ -132,18 +136,21 @@ type textStyle struct {
 // drawText draw inline texts with multiple styles.
 // Note that it does not handle tab expansion.
 func (v *View) drawText(texts ...textStyle) {
-	var col int
+	col := 0
 	for _, ts := range texts {
 		style := ts.style
 		if style == tcell.StyleDefault {
 			style = v.style
 		}
 		for _, c := range ts.text {
+			if col >= v.w {
+				break
+			}
 			screen.SetContent(v.x+col, v.y, c, nil, style)
-			col++
+			col += runewidth.RuneWidth(c)
 		}
 	}
-	// clear remaining space
+	// Clear remaining space
 	for i := col; i < v.w; i++ {
 		screen.SetContent(v.x+i, v.y, ' ', nil, v.style)
 	}
@@ -167,26 +174,45 @@ func (a *App) resize() {
 const tabSize = 4
 
 // expandTabs converts all tabs in a line to spaces for display
-func expandTabs(line string) string {
+func expandTabs(line []rune) []rune {
 	var result strings.Builder
+	col := 0
 	for _, char := range line {
 		if char == '\t' {
 			// Add spaces to reach the next tab stop
-			spaces := tabSize - (result.Len() % tabSize)
+			spaces := tabSize - (col % tabSize)
 			result.WriteString(strings.Repeat(" ", spaces))
+			col += spaces
 		} else {
 			result.WriteRune(char)
+			col += runewidth.RuneWidth(char)
 		}
 	}
-	return result.String()
+	return []rune(result.String())
 }
 
-// columnToScreen converts a column position in the original line to the screen line
-func columnToScreen(line string, col int) int {
+// columnToVisual converts a column index in the line to column index in screen line
+func columnToVisual(line []rune, col int) int {
 	if col > len(line) {
 		col = len(line)
 	}
+	visualCol := 0
+	for i := range col {
+		if line[i] == '\t' {
+			visualCol += tabSize - (visualCol % tabSize)
+		} else {
+			visualCol++
+		}
+	}
+	return visualCol
+}
 
+// columnToScreenWidth converts a column index in the line to its screen width,
+// accounting for tabs and Unicode character widths (e.g., double-width for East Asian characters).
+func columnToScreenWidth(line []rune, col int) int {
+	if col > len(line) {
+		col = len(line)
+	}
 	screenCol := 0
 	for i, char := range line {
 		if i >= col {
@@ -196,45 +222,39 @@ func columnToScreen(line string, col int) int {
 			spaces := tabSize - (screenCol % tabSize)
 			screenCol += spaces
 		} else {
-			screenCol++
+			screenCol += runewidth.RuneWidth(char)
 		}
 	}
 	return screenCol
 }
 
-// columnFromScreen converts a column position in the screen line back to the original line
-func columnFromScreen(line string, screenCol int) int {
+// columnFromScreenWidth converts screen width to column index in the line.
+// Use this to get the line column index from screen width
+func columnFromScreenWidth(line []rune, screenCol int) int {
 	if screenCol <= 0 {
 		return 0
 	}
-
-	originalCol := 0
-	currentScreenCol := 0
-
+	width := 0
 	for i, char := range line {
-		if currentScreenCol >= screenCol {
-			return originalCol
-		}
-
 		if char == '\t' {
-			spaces := tabSize - (currentScreenCol % tabSize)
-			currentScreenCol += spaces
+			spaces := tabSize - (width % tabSize)
+			width += spaces
 		} else {
-			currentScreenCol++
+			width += runewidth.RuneWidth(char)
 		}
-		originalCol = i + 1
+		if screenCol < width {
+			return i
+		}
 	}
-
-	return originalCol
+	return len(line)
 }
 
 // draw the whole layout and cursor
 func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
-	//a.status.draw(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 	a.drawStatus()
-	a.console.draw(a.s.console)
+	a.console.draw(string(a.s.console))
 	a.syncCursor()
 }
 
@@ -278,12 +298,13 @@ func (a *App) drawTabs() {
 func (a *App) drawStatus(msg ...string) {
 	if len(msg) == 0 {
 		lineCol := fmt.Sprintf("Line %d, Column %d ", a.s.row+1, a.s.col+1)
-		padding := max(0, a.status.w-len(a.s.filename)-len(lineCol))
-		a.status.drawText(
-			textStyle{text: a.s.filename},
-			textStyle{text: strings.Repeat(" ", padding)},
-			textStyle{text: lineCol},
-		)
+		// padding := max(0, a.status.w-len(a.s.filename)-len(lineCol))
+		// a.status.drawText(
+		// 	textStyle{text: a.s.filename},
+		// 	textStyle{text: strings.Repeat(" ", padding)},
+		// 	textStyle{text: lineCol},
+		// )
+		a.status.draw(lineCol)
 		return
 	}
 
@@ -323,7 +344,7 @@ func (st *State) lineNumLen() int {
 }
 
 // drawEditorLine draws the line with automatic tab expansion and syntax highlight
-func (a *App) drawEditorLine(row int, line string) {
+func (a *App) drawEditorLine(row int, line []rune) {
 	var lineNumber string
 	if a.s.lineNumber {
 		lineNumber = a.s.newLineNum(row)
@@ -331,10 +352,18 @@ func (a *App) drawEditorLine(row int, line string) {
 
 	screenLine := expandTabs(line)
 	if a.s.left > 0 {
-		if a.s.left >= len(screenLine) {
-			screenLine = ""
-		} else {
-			screenLine = screenLine[a.s.left:]
+		// Adjust for horizontal scroll, accounting for rune widths
+		screenCol := 0
+		for i, r := range screenLine {
+			if screenCol >= a.s.left {
+				screenLine = screenLine[i:]
+				break
+			}
+			screenCol += runewidth.RuneWidth(r)
+		}
+		if screenCol < a.s.left {
+			screenLine = nil
+			a.editor[row-a.s.top].draw("")
 		}
 	}
 
@@ -342,19 +371,16 @@ func (a *App) drawEditorLine(row int, line string) {
 	if sel := a.s.selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
 		start, end := 0, len(screenLine)
 		if sel.startRow == row {
-			start = columnToScreen(line, sel.startCol)
+			start = columnToVisual(line, sel.startCol)
 		}
 		if sel.endRow == row {
-			end = columnToScreen(line, sel.endCol)
-		}
-		if start > end {
-			start, end = end, start
+			end = columnToVisual(line, sel.endCol)
 		}
 		a.editor[row-a.s.top].drawText(
 			textStyle{text: lineNumber, style: styleComment},
-			textStyle{text: screenLine[:start]},
-			textStyle{text: screenLine[start:end], style: styleHighlight},
-			textStyle{text: screenLine[end:]},
+			textStyle{text: string(screenLine[:start])},
+			textStyle{text: string(screenLine[start:end]), style: styleHighlight},
+			textStyle{text: string(screenLine[end:])},
 		)
 		return
 	}
@@ -362,13 +388,13 @@ func (a *App) drawEditorLine(row int, line string) {
 	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 		a.editor[row-a.s.top].drawText(
 			textStyle{text: lineNumber, style: styleComment},
-			textStyle{text: screenLine, style: styleBase},
+			textStyle{text: string(screenLine), style: styleBase},
 		)
 		return
 	}
 
 	// syntax highlight
-	parts := highlightGoLine(screenLine)
+	parts := highlightGoLine(string(screenLine))
 	s := make([]textStyle, 0, len(parts)+1)
 	s = append(s, textStyle{text: lineNumber, style: styleComment})
 	s = append(s, parts...)
@@ -387,7 +413,7 @@ func (a *App) drawEditor() {
 			lineView.draw("")
 			continue
 		}
-		line := e.Value.(string)
+		line := e.Value.([]rune)
 		a.drawEditorLine(a.s.top+i, line)
 		e = e.Next()
 	}
@@ -459,7 +485,7 @@ func main() {
 		} else {
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
-				app.s.lines.PushBack(scanner.Text())
+				app.s.lines.PushBack([]rune(scanner.Text()))
 			}
 			if err := scanner.Err(); err != nil {
 				log.Print(err)
@@ -550,7 +576,7 @@ func main() {
 					}
 					var src strings.Builder
 					for e := app.s.lines.Front(); e != nil; e = e.Next() {
-						src.WriteString(e.Value.(string))
+						src.WriteString(string(e.Value.([]rune)))
 						if e != app.s.lines.Back() {
 							src.WriteByte('\n')
 						}
@@ -568,12 +594,13 @@ func main() {
 				if ev.Key() == tcell.KeyCtrlF {
 					var selected string
 					if sel := app.s.selected(); sel != nil && sel.startRow == sel.endRow {
-						line := app.s.line(sel.startRow)
-						if line != nil {
-							selected = line.Value.(string)[sel.startCol:sel.endCol]
+						e := app.s.line(sel.startRow)
+						if e != nil {
+							line := e.Value.([]rune)
+							selected = string(line[sel.startCol:sel.endCol])
 						}
 					}
-					if selected != "" {
+					if len(selected) > 0 {
 						app.setConsole("#" + selected)
 					} else {
 						app.setConsole("#", "find")
@@ -749,7 +776,7 @@ func (a *App) handleClick(x, y int) {
 
 	if a.console.contains(x, y) {
 		a.s.focus = focusConsole
-		// a.setConsole("")
+		a.s.consoleCursor = columnFromScreenWidth([]rune(a.s.console), x-a.console.x)
 		a.syncCursor()
 		return
 	}
@@ -764,10 +791,9 @@ func (a *App) handleClick(x, y int) {
 		a.s.col = 0
 	} else {
 		row := min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
-		line := a.s.line(row).Value.(string)
+		line := a.s.line(row).Value.([]rune)
 		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
-		// Convert screen position back to original line position
-		col := min(len(line), columnFromScreen(line, screenCol))
+		col := columnFromScreenWidth(line, screenCol)
 		a.recordPositon(a.s.row, a.s.col)
 		a.s.row = row
 		a.s.col = col
@@ -782,7 +808,6 @@ func (a *App) handleClick(x, y int) {
 		}
 		a.s.selecting = true
 	} else {
-		// draging the selection
 		a.s.selection.endRow = a.s.row
 		a.s.selection.endCol = a.s.col
 	}
@@ -791,12 +816,16 @@ func (a *App) handleClick(x, y int) {
 	a.drawEditor()
 	a.syncCursor()
 	a.s.upDownCol = -1 // reset up/down column tracking
+	// debug
+	if line := a.s.line(a.s.row); line != nil {
+		log.Printf("clicked line: %s", string(line.Value.([]rune)))
+	}
 }
 
 // setConsole updates the console view with the given string.
 func (a *App) setConsole(s string, hint ...string) {
-	a.s.console = s
-	a.s.consoleCursor = len(s)
+	a.s.console = []rune(s)
+	a.s.consoleCursor = len(a.s.console)
 	if len(hint) == 0 {
 		a.console.draw(s)
 	} else {
@@ -816,7 +845,7 @@ func (a *App) jump(row, col int) {
 	if lineItem == nil {
 		return
 	}
-	line := lineItem.Value.(string)
+	line := lineItem.Value.([]rune)
 	if col < 0 || col > len(line) {
 		col = len(line)
 	}
@@ -848,7 +877,7 @@ func (a *App) jump(row, col int) {
 	}
 
 	w := a.editor[0].w
-	if i := columnToScreen(line, a.s.col); i < a.s.left {
+	if i := columnToScreenWidth(line, a.s.col); i < a.s.left {
 		a.s.left = i
 		scroll = true
 	} else if i > a.s.left+(w-a.s.lineNumLen()-1) {
@@ -864,11 +893,11 @@ func (a *App) jump(row, col int) {
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	defer func() {
-		a.console.draw(a.s.console)
+		a.console.draw(string(a.s.console))
 		a.syncCursor()
 	}()
 	exitConsole := func() {
-		a.s.console = ""
+		a.s.console = nil
 		a.s.focus = focusEditor
 		a.drawStatus()
 	}
@@ -877,10 +906,10 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		exitConsole()
 		// reset matched text
 		if line := a.s.line(a.s.row); line != nil {
-			a.drawEditorLine(a.s.row, line.Value.(string))
+			a.drawEditorLine(a.s.row, line.Value.([]rune))
 		}
 	case tcell.KeyEnter:
-		cmd := strings.TrimSpace(a.s.console)
+		cmd := strings.TrimSpace(string(a.s.console))
 		if cmd == "" {
 			if len(a.s.options) > 0 && a.s.optionIdx >= 0 {
 				a.cmdCh <- ">open " + a.s.options[a.s.optionIdx]
@@ -907,32 +936,32 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			cmd = ">open " + a.s.options[a.s.optionIdx]
 		}
-		a.s.console = ""
+		a.s.console = nil
 		a.cmdCh <- cmd
 	case tcell.KeyLeft:
-		if a.s.console == "" {
+		if len(a.s.console) == 0 {
 			return
 		}
 		a.s.consoleCursor--
 	case tcell.KeyRight:
-		if a.s.console == "" || a.s.consoleCursor >= len(a.s.console) {
+		if len(a.s.console) == 0 || a.s.consoleCursor >= len(a.s.console) {
 			return
 		}
 		a.s.consoleCursor++
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if a.s.console == "" {
+		if len(a.s.console) == 0 {
 			return
 		}
-		a.s.console = a.s.console[:a.s.consoleCursor-1] + a.s.console[a.s.consoleCursor:]
+		a.s.console = slices.Delete(a.s.console, a.s.consoleCursor-1, a.s.consoleCursor)
 		a.s.consoleCursor--
-		if a.s.console == "" {
+		if len(a.s.console) == 0 {
 			a.s.options = a.s.files
 			a.s.optionIdx = -1
 		} else if char := a.s.console[0]; char == '#' || char == ':' || char == '>' {
 			return
 		} else if char == '@' {
-			keyword := a.s.console[1:]
-			if keyword == "" {
+			keyword := string(a.s.console[1:])
+			if len(keyword) == 0 {
 				a.s.options = nil
 				a.status.draw("")
 				return
@@ -970,7 +999,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			if len(a.s.files) == 0 {
 				return
 			}
-			keyword := a.s.console
+			keyword := string(a.s.console)
 			var filter []string
 			for _, name := range a.s.files {
 				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
@@ -1003,15 +1032,13 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		}
 		a.status.drawText(ts...)
 	case tcell.KeyRune:
-		rs := []rune(a.s.console)
-		rs = slices.Insert(rs, a.s.consoleCursor, ev.Rune())
-		a.s.console = string(rs)
+		a.s.console = slices.Insert(a.s.console, a.s.consoleCursor, ev.Rune())
 		a.s.consoleCursor++
 		switch a.s.console[0] {
 		case '>', '#', ':':
 			return
 		case '@':
-			keyword := a.s.console[1:]
+			keyword := string(a.s.console[1:])
 			if keyword == "" {
 				return
 			}
@@ -1056,7 +1083,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			if len(a.s.files) == 0 {
 				return
 			}
-			keyword := a.s.console
+			keyword := string(a.s.console)
 			var filter []string
 			for _, name := range a.s.files {
 				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
@@ -1105,7 +1132,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.status.drawText(ts...)
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
-		if strings.Index(a.s.console, "#") == 0 {
+		if len(a.s.console) > 0 && a.s.console[0] == '#' {
 			a.goBack()
 			keyword := a.s.console[1:]
 			a.s.selection = &Selection{
@@ -1212,9 +1239,9 @@ func (a *App) handleCommand(cmd string) {
 				return
 			}
 			filename := c[1]
-			var content []string
+			content := make([]string, 0, a.s.lines.Len())
 			for e := a.s.lines.Front(); e != nil; e = e.Next() {
-				content = append(content, e.Value.(string))
+				content = append(content, string(e.Value.([]rune)))
 			}
 			// append newline at end of file
 			if len(content) == 0 || content[len(content)-1] != "" {
@@ -1278,11 +1305,11 @@ func (a *App) handleCommand(cmd string) {
 		a.recordPositon(a.s.row, a.s.col)
 		a.jump(matched.Line-1, matched.Column-1)
 		a.s.focus = focusEditor
-		a.s.console = ""
+		a.s.console = nil
 		a.draw()
 	case '#': // find
-		text := cmd[1:]
-		if text == "" {
+		keyword := []rune(cmd[1:])
+		if len(keyword) == 0 {
 			return
 		}
 		row := a.s.row
@@ -1303,11 +1330,11 @@ func (a *App) handleCommand(cmd string) {
 				a.syncCursor()
 				return
 			}
-			line := e.Value.(string)
-			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(text)); i >= 0 {
+			line := string(e.Value.([]rune))
+			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(string(keyword))); i >= 0 {
 				a.recordPositon(a.s.row, a.s.col)
-				a.jump(row, col+i+len(text))
-				a.s.selection = &Selection{startRow: row, endRow: row, startCol: col + i, endCol: col + i + len(text)}
+				a.jump(row, col+i+len(keyword))
+				a.s.selection = &Selection{startRow: row, endRow: row, startCol: col + i, endCol: col + i + len(keyword)}
 				a.setConsole(cmd) // incremental search
 				a.draw()
 				return
@@ -1338,37 +1365,37 @@ func (a *App) syncCursor() {
 	switch a.s.focus {
 	case focusEditor:
 		if a.s.row < a.s.top || a.s.row > (a.s.top+len(a.editor)-1) {
-			// out of viewport
 			screen.HideCursor()
 			return
 		}
 		lineElement := a.s.line(a.s.row)
 		if lineElement == nil {
 			if a.s.row == 0 && a.s.col == 0 {
-				// No line exists, cursor at start of editor
 				screen.ShowCursor(a.editor[0].x, a.editor[0].y)
 			}
 			return
 		}
 
-		line := lineElement.Value.(string)
-		screenCol := columnToScreen(line, a.s.col) - a.s.left
+		line := lineElement.Value.([]rune)
+		screenCol := columnToScreenWidth(line, a.s.col) - a.s.left
 		x := a.editor[0].x + a.s.lineNumLen() + screenCol
 		y := a.editor[0].y + a.s.row - a.s.top
+		if x < a.editor[0].x || x >= a.editor[0].x+a.editor[0].w {
+			screen.HideCursor() // Hide cursor if out of view
+			return
+		}
 		screen.ShowCursor(x, y)
 
 		if sel := a.s.selected(); sel != nil && sel.startRow <= a.s.row && a.s.row <= sel.endRow {
-			// selection highlighted, no more line highlight
 			return
 		}
-		// render current line
+		// Render current line highlight
 		w, _ := screen.Size()
 		for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
 			r, _, style, _ := screen.GetContent(x, y)
 			screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
 		}
 		if a.s.row != prevHighlightLine {
-			// clear previous line
 			prevY := a.editor[0].y + prevHighlightLine - a.s.top
 			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
 				r, _, style, _ := screen.GetContent(x, prevY)
@@ -1377,7 +1404,16 @@ func (a *App) syncCursor() {
 			prevHighlightLine = a.s.row
 		}
 	case focusConsole:
-		screen.ShowCursor(a.console.x+a.s.consoleCursor, a.console.y)
+		// Calculate visual width of console text up to cursor
+		consoleRunes := []rune(a.s.console)
+		if a.s.consoleCursor > len(consoleRunes) {
+			a.s.consoleCursor = len(consoleRunes)
+		}
+		consoleWidth := 0
+		for i := 0; i < a.s.consoleCursor && i < len(consoleRunes); i++ {
+			consoleWidth += runewidth.RuneWidth(consoleRunes[i])
+		}
+		screen.ShowCursor(a.console.x+consoleWidth, a.console.y)
 	default:
 		screen.HideCursor()
 	}
@@ -1399,11 +1435,11 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.redo()
 		a.drawEditor()
 	case tcell.KeyRune:
-		var line string
+		var line []rune
 		e := a.s.line(a.s.row)
 		if e == nil {
 			// No line exists, create a new one
-			line = string(ev.Rune())
+			line = []rune{ev.Rune()}
 			a.s.lines.PushBack(line)
 			a.s.recordEdit(Edit{
 				row:     a.s.row,
@@ -1422,9 +1458,9 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.selection = nil
 
 			// Insert the new rune
-			line = a.s.line(a.s.row).Value.(string)
+			line = a.s.line(a.s.row).Value.([]rune)
 			newText := string(ev.Rune())
-			line = line[:a.s.col] + newText + line[a.s.col:]
+			line = slices.Insert(line, a.s.col, ev.Rune())
 			a.s.line(a.s.row).Value = line
 			a.s.col += len(newText)
 
@@ -1444,8 +1480,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 
 		// No selection, insert rune normally
-		line = e.Value.(string)
-		line = line[:a.s.col] + string(ev.Rune()) + line[a.s.col:]
+		line = e.Value.([]rune)
+		line = slices.Insert(line, a.s.col, ev.Rune())
 		e.Value = line
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
@@ -1467,7 +1503,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		} else {
 			// break the line
 			// a Enter may comes from paste, do not auto-indent
-			line := e.Value.(string)
+			line := e.Value.([]rune)
 			a.s.lines.InsertAfter(line[a.s.col:], e)
 			e.Value = line[:a.s.col]
 			a.s.col = 0
@@ -1476,7 +1512,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.jump(a.s.row, a.s.col)
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		// Handle sel deletion
+		// delete selection
 		if sel := a.s.selected(); sel != nil {
 			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
@@ -1489,7 +1525,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
-				a.drawEditorLine(a.s.row, line.Value.(string))
+				a.drawEditorLine(a.s.row, line.Value.([]rune))
 			}
 			return
 		}
@@ -1503,22 +1539,23 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.lastEdit = nil
 			a.s.undoStack = nil
 			a.s.redoStack = nil
-			line := a.s.line(a.s.row)
-			prevLine := line.Prev()
-			a.s.col = len(prevLine.Value.(string))
-			prevLine.Value = prevLine.Value.(string) + line.Value.(string)
-			a.s.lines.Remove(line)
+			element := a.s.line(a.s.row)
+			prevElement := element.Prev()
+			prevLine := prevElement.Value.([]rune)
+			a.s.col = len(prevLine)
+			prevElement.Value = append(prevLine, element.Value.([]rune)...)
+			a.s.lines.Remove(element)
 			a.s.row--
 			a.jump(a.s.row, a.s.col)
 			a.drawEditor()
 			return
 		}
 
-		line := a.s.line(a.s.row)
-		text := line.Value.(string)
-		deleted := text[a.s.col-1]
-		text = text[:a.s.col-1] + text[a.s.col:]
-		line.Value = text
+		element := a.s.line(a.s.row)
+		line := element.Value.([]rune)
+		deleted := line[a.s.col-1]
+		line = append(line[:a.s.col-1], line[a.s.col:]...)
+		element.Value = line
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
 			col:     a.s.col - 1,
@@ -1527,7 +1564,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		})
 		a.s.col--
 		a.jump(a.s.row, a.s.col)
-		a.drawEditorLine(a.s.row, text)
+		a.drawEditorLine(a.s.row, line)
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
 		// move cursor to the start of the selection
@@ -1540,23 +1577,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		// file start
 		if a.s.row == 0 && a.s.col == 0 {
-			return
-		}
-
-		// command+left go to the start of line, works in kitty
-		if ev.Modifiers()&tcell.ModMeta != 0 {
-			line := a.s.line(a.s.row)
-			if line == nil {
-				return
-			}
-			text := line.Value.(string)
-			for i, r := range text {
-				if r != ' ' && r != '\t' {
-					a.s.col = i
-					break
-				}
-			}
-			a.jump(a.s.row, a.s.col)
 			return
 		}
 
@@ -1585,7 +1605,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if lineItem == nil {
 			return
 		}
-		line := lineItem.Value.(string)
+		line := lineItem.Value.([]rune)
 		// middle of the line
 		if a.s.col < len(line) {
 			a.jump(a.s.row, a.s.col+1)
@@ -1611,8 +1631,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 
 		a.s.row--
-		line := a.s.line(a.s.row).Value.(string)
-		if line == "" {
+		line := a.s.line(a.s.row).Value.([]rune)
+		if len(line) == 0 {
 			a.s.col = 0
 		} else if a.s.upDownCol >= 0 {
 			// moving up/down, keep previous column
@@ -1638,8 +1658,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 
 		a.s.row++
-		line := a.s.line(a.s.row).Value.(string)
-		if line == "" {
+		line := a.s.line(a.s.row).Value.([]rune)
+		if len(line) == 0 {
 			a.s.col = 0
 		} else if a.s.upDownCol >= 0 {
 			// moving up/down, keep previous column
@@ -1659,7 +1679,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if line == nil {
 			return
 		}
-		text := line.Value.(string)
+		text := line.Value.([]rune)
 		for i, r := range text {
 			if r != ' ' && r != '\t' {
 				a.s.col = i
@@ -1673,17 +1693,17 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.jump(a.s.row, -1)
 	case tcell.KeyTAB:
 		a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: "\t", kind: editInsert})
-		s := "\t"
+		char := '\t'
 		e := a.s.line(a.s.row)
 		if e == nil {
-			e = a.s.lines.PushBack(s)
+			e = a.s.lines.PushBack([]rune{char})
 		} else {
-			line := e.Value.(string)
-			line = line[:a.s.col] + s + line[a.s.col:]
-			a.s.col += len(s)
+			line := e.Value.([]rune)
+			line = slices.Insert(line, a.s.col, char)
+			a.s.col++
 			e.Value = line
 		}
-		a.drawEditorLine(a.s.row, e.Value.(string))
+		a.drawEditorLine(a.s.row, e.Value.([]rune))
 	case tcell.KeyPgUp:
 		a.unselect()
 		// go to previous page or the top of the page
@@ -1702,41 +1722,42 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.jump(a.s.row, a.s.col)
 	case tcell.KeyCtrlC:
 		if sel := a.s.selected(); sel != nil {
-			line := a.s.line(sel.startRow)
-			var s strings.Builder
+			e := a.s.line(sel.startRow)
+			var copied []rune
 			if sel.startRow == sel.endRow {
 				// Single line selection
-				s.WriteString(line.Value.(string)[sel.startCol:sel.endCol])
+				line := e.Value.([]rune)
+				copied = append(copied, line[sel.startCol:sel.endCol]...)
 			} else {
-				for i := sel.startRow; i <= sel.endRow && line != nil; i++ {
-					text := line.Value.(string)
+				for i := sel.startRow; i <= sel.endRow && e != nil; i++ {
+					text := e.Value.([]rune)
 					switch i {
 					case sel.startRow:
-						s.WriteString(text[sel.startCol:])
-						s.WriteString("\n")
+						copied = append(copied, text[sel.startCol:]...)
+						copied = append(copied, '\n')
 					case sel.endRow:
-						s.WriteString(text[:sel.endCol])
+						copied = append(copied, text[:sel.endCol]...)
 					default:
-						s.WriteString(text)
-						s.WriteString("\n")
+						copied = append(copied, text...)
+						copied = append(copied, '\n')
 					}
-					line = line.Next()
+					e = e.Next()
 				}
 			}
-			a.s.clipboard = s.String()
+			a.s.clipboard = string(copied)
 			return
 		}
 
-		// Copy the current line to clipboard
-		line := a.s.line(a.s.row)
-		if line == nil {
+		// Copy the current e to clipboard
+		e := a.s.line(a.s.row)
+		if e == nil {
 			return
 		}
-		text := line.Value.(string)
-		if text == "" {
+		line := e.Value.([]rune)
+		if len(line) == 0 {
 			return
 		}
-		a.s.clipboard = text
+		a.s.clipboard = string(line)
 	case tcell.KeyCtrlX:
 		if sel := a.s.selected(); sel != nil {
 			// Cut the selected text
@@ -1752,21 +1773,21 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
-				a.drawEditorLine(a.s.row, line.Value.(string))
+				a.drawEditorLine(a.s.row, line.Value.([]rune))
 			}
 			return
 		}
 
-		// Cut the current line
-		line := a.s.line(a.s.row)
-		if line == nil {
+		// Cut the current e
+		e := a.s.line(a.s.row)
+		if e == nil {
 			return
 		}
-		text := line.Value.(string)
-		if text == "" {
+		line := e.Value.([]rune)
+		if len(line) == 0 {
 			return
 		}
-		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(text))
+		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(line))
 		a.s.clipboard = deletedText
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
@@ -1849,33 +1870,33 @@ func (st *State) insertAt(s string, row, col int) {
 	}
 
 	lines := strings.Split(s, "\n")
+	// Single line
 	if len(lines) == 1 {
-		// Single line insertion
-		line := e.Value.(string)
-		line = line[:col] + s + line[col:]
+		chars := []rune(lines[0])
+		line := slices.Insert(e.Value.([]rune), col, chars...)
 		e.Value = line
 		st.row = row
-		st.col = col + len(s)
+		st.col = col + len(chars)
 		return
 	}
 
-	origin := e.Value.(string)
-
-	// multi-line insertion
+	// multiple lines
+	origin := e.Value.([]rune)
 	for i, line := range lines {
+		chars := []rune(line)
 		if i == 0 {
 			// First line
-			e.Value = origin[:col] + line
+			e.Value = append(origin[:col], chars...)
 		} else if i == len(lines)-1 {
 			// Last line
-			st.lines.InsertAfter(line+origin[col:], e)
+			st.lines.InsertAfter(append(chars, origin[col:]...), e)
 		} else {
 			// Middle lines
-			e = st.lines.InsertAfter(line, e)
+			e = st.lines.InsertAfter(chars, e)
 		}
 	}
 	st.row += len(lines) - 1
-	st.col = len(lines[len(lines)-1])
+	st.col = len([]rune(lines[len(lines)-1]))
 }
 
 // unselect cancel the selection and redraws the affected lines.
@@ -1888,7 +1909,7 @@ func (a *App) unselect() {
 	a.s.selection = nil
 	line := a.s.line(selection.startRow)
 	for i := selection.startRow; i <= selection.endRow && line != nil; i++ {
-		a.drawEditorLine(i, line.Value.(string))
+		a.drawEditorLine(i, line.Value.([]rune))
 		line = line.Next()
 	}
 }
@@ -1923,31 +1944,32 @@ func (st *State) deleteRange(startRow, startCol, endRow, endCol int) string {
 	var deleted strings.Builder
 	if startRow == endRow {
 		// Single-line
-		line := st.line(startRow).Value.(string)
-		deleted.WriteString(line[startCol:endCol])
-		line = line[:startCol] + line[endCol:]
-		st.line(startRow).Value = line
+		element := st.line(startRow)
+		line := element.Value.([]rune)
+		deleted.WriteString(string(line[startCol:endCol]))
+		line = slices.Delete(line, startCol, endCol)
+		element.Value = line
 	} else {
-		// Multi-line
-		line := st.line(startRow)
-		firstLineLeft := line.Value.(string)[:startCol]
-		for i := startRow; i <= endRow && line != nil; i++ {
-			text := line.Value.(string)
-			next := line.Next()
+		// Multi-element
+		element := st.line(startRow)
+		firstLineLeft := element.Value.([]rune)[:startCol]
+		for i := startRow; i <= endRow && element != nil; i++ {
+			line := element.Value.([]rune)
+			next := element.Next()
 			switch i {
 			case startRow:
-				deleted.WriteString(text[startCol:])
+				deleted.WriteString(string(line[startCol:]))
 				deleted.WriteString("\n")
-				st.lines.Remove(line)
+				st.lines.Remove(element)
 			case endRow:
-				deleted.WriteString(text[:endCol])
-				line.Value = firstLineLeft + text[endCol:]
+				deleted.WriteString(string(line[:endCol]))
+				element.Value = append(firstLineLeft, line[endCol:]...)
 			default:
-				deleted.WriteString(text)
+				deleted.WriteString(string(line))
 				deleted.WriteString("\n")
-				st.lines.Remove(line)
+				st.lines.Remove(element)
 			}
-			line = next
+			element = next
 		}
 	}
 	st.row = startRow
@@ -2205,7 +2227,7 @@ func highlightGoLine(line string) []textStyle {
 			w := word.String()
 			if token.IsKeyword(w) {
 				parts = append(parts, textStyle{text: w, style: styleKeyword})
-			} else if _, err := strconv.Atoi(w); err == nil {
+			} else if _, err := strconv.ParseFloat(w, 64); err == nil && !strings.Contains(w, " ") {
 				parts = append(parts, textStyle{text: w, style: styleNumber})
 			} else {
 				parts = append(parts, textStyle{text: w, style: styleBase})
@@ -2216,7 +2238,6 @@ func highlightGoLine(line string) []textStyle {
 
 	for i := range runes {
 		c := runes[i]
-
 		// Line comment
 		if !inString && c == '/' && i+1 < len(runes) && runes[i+1] == '/' {
 			flushWord()
@@ -2245,7 +2266,7 @@ func highlightGoLine(line string) []textStyle {
 		}
 
 		// Word boundary
-		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' {
+		if unicode.IsLetter(c) || c == '_' || (word.Len() > 0 && unicode.IsDigit(c)) {
 			word.WriteRune(c)
 		} else {
 			flushWord()
