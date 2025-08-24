@@ -29,7 +29,7 @@ const (
 type App struct {
 	s       *State
 	tab     View
-	editor  []*View // viewport
+	editor  []*View
 	status  View
 	console View
 	cmdCh   chan string
@@ -175,20 +175,22 @@ const tabSize = 4
 
 // expandTabs converts all tabs in a line to spaces for display
 func expandTabs(line []rune) []rune {
-	var result strings.Builder
+	newline := make([]rune, 0, len(line))
 	col := 0
 	for _, char := range line {
 		if char == '\t' {
 			// Add spaces to reach the next tab stop
 			spaces := tabSize - (col % tabSize)
-			result.WriteString(strings.Repeat(" ", spaces))
+			for range spaces {
+				newline = append(newline, ' ')
+			}
 			col += spaces
 		} else {
-			result.WriteRune(char)
+			newline = append(newline, char)
 			col += runewidth.RuneWidth(char)
 		}
 	}
-	return []rune(result.String())
+	return newline
 }
 
 // columnToVisual converts a column index in the line to column index in screen line
@@ -402,7 +404,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 	}
 
 	// syntax highlight
-	parts := highlightGoLine(string(screenLine))
+	parts := highlightGoLine(screenLine)
 	s := make([]textStyle, 0, len(parts)+1)
 	s = append(s, textStyle{text: lineNumber, style: styleComment})
 	s = append(s, parts...)
@@ -586,7 +588,7 @@ func main() {
 					for e := app.s.lines.Front(); e != nil; e = e.Next() {
 						src.WriteString(string(e.Value.([]rune)))
 						if e != app.s.lines.Back() {
-							src.WriteByte('\n')
+							src.WriteString("\n")
 						}
 					}
 					symbols, err := ParseSymbol(app.s.filename, src.String())
@@ -2225,9 +2227,8 @@ var (
 	cursorColor = tcell.ColorDarkGray
 )
 
-func highlightGoLine(line string) []textStyle {
+func highlightGoLine(line []rune) []textStyle {
 	var parts []textStyle
-	runes := []rune(line)
 
 	var inString bool
 	var inComment bool
@@ -2237,7 +2238,7 @@ func highlightGoLine(line string) []textStyle {
 			w := word.String()
 			if token.IsKeyword(w) {
 				parts = append(parts, textStyle{text: []rune(w), style: styleKeyword})
-			} else if _, err := strconv.ParseFloat(w, 64); err == nil && !strings.Contains(w, " ") {
+			} else if _, err := strconv.Atoi(w); err == nil {
 				parts = append(parts, textStyle{text: []rune(w), style: styleNumber})
 			} else {
 				parts = append(parts, textStyle{text: []rune(w), style: styleBase})
@@ -2246,12 +2247,11 @@ func highlightGoLine(line string) []textStyle {
 		}
 	}
 
-	for i := range runes {
-		c := runes[i]
+	for i, c := range line {
 		// Line comment
-		if !inString && c == '/' && i+1 < len(runes) && runes[i+1] == '/' {
+		if !inString && c == '/' && i+1 < len(line) && line[i+1] == '/' {
 			flushWord()
-			parts = append(parts, textStyle{text: runes[i:], style: styleComment})
+			parts = append(parts, textStyle{text: line[i:], style: styleComment})
 			return parts
 		}
 
@@ -2276,7 +2276,7 @@ func highlightGoLine(line string) []textStyle {
 		}
 
 		// Word boundary
-		if unicode.IsLetter(c) || c == '_' || (word.Len() > 0 && unicode.IsDigit(c)) {
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' {
 			word.WriteRune(c)
 		} else {
 			flushWord()
