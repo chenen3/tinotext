@@ -53,7 +53,7 @@ type State struct {
 
 type Tab struct {
 	filename     string
-	lines        *list.List          // element value is []rune
+	lines        *list.List          // element is rune slice
 	row          int                 // Current row position (starts from 0)
 	col          int                 // Current column position (starts from 0)
 	top          int                 // vertical scroll  (starts from 0)
@@ -113,7 +113,7 @@ type View struct {
 }
 
 // draw draws a line and clears the remaining space
-func (v *View) draw(line string) {
+func (v *View) draw(line []rune) {
 	col := 0
 	for _, c := range line {
 		if col >= v.w {
@@ -129,7 +129,7 @@ func (v *View) draw(line string) {
 }
 
 type textStyle struct {
-	text  string
+	text  []rune
 	style tcell.Style
 }
 
@@ -254,42 +254,50 @@ func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
 	a.drawStatus()
-	a.console.draw(string(a.s.console))
+	a.console.draw(a.s.console)
 	a.syncCursor()
 }
 
 const (
-	labelClose = " x|"
-	labelNew   = " New "
-	labelOpen  = " Open "
-	labelSave  = " Save "
-	labelQuit  = " Quit "
+	labelClose = "x|"
+	labelNew   = "New"
+	labelOpen  = "Open"
+	labelSave  = "Save"
+	labelQuit  = "Quit"
 )
+
+var menu = []string{labelNew, labelOpen, labelSave, labelQuit}
 
 func (a *App) drawTabs() {
 	var ts []textStyle
 	var totalTabWidth int
 	for i, tab := range a.s.tabs {
-		name := filepath.Base(tab.filename)
-		if name == "" {
+		var name string
+		if tab.filename == "" {
 			name = "untitled"
+		} else {
+			name = filepath.Base(tab.filename)
 		}
 		if i == a.s.activeTabIdx {
-			ts = append(ts, textStyle{text: name, style: a.tab.style.Bold(true).Underline(true).Italic(true)})
-			ts = append(ts, textStyle{text: labelClose, style: a.tab.style.Bold(true)})
+			ts = append(ts, textStyle{text: []rune(name), style: a.tab.style.Bold(true).Underline(true).Italic(true)})
 		} else {
-			ts = append(ts, textStyle{text: name})
-			ts = append(ts, textStyle{text: labelClose})
+			ts = append(ts, textStyle{text: []rune(name)})
 		}
-		totalTabWidth += len(name) + len(labelClose)
+		ts = append(ts, textStyle{text: []rune{' '}})
+		ts = append(ts, textStyle{text: []rune(labelClose)})
+		ts = append(ts, textStyle{text: []rune{' '}})
+		for _, c := range name {
+			totalTabWidth += runewidth.RuneWidth(c)
+		}
+		totalTabWidth += len(labelClose) + 2
 	}
 
-	labels := labelNew + labelOpen + labelSave + labelQuit
-	padding := max(0, a.tab.w-totalTabWidth-len(labels))
+	menuS := strings.Join(menu, " ")
+	padding := a.tab.w - totalTabWidth - len(menuS)
 	if padding > 0 {
-		ts = append(ts, textStyle{text: strings.Repeat(" ", padding)})
+		ts = append(ts, textStyle{text: []rune(strings.Repeat(" ", padding))})
 	}
-	ts = append(ts, textStyle{text: labels})
+	ts = append(ts, textStyle{text: []rune(menuS)})
 	a.tab.drawText(ts...)
 }
 
@@ -304,11 +312,11 @@ func (a *App) drawStatus(msg ...string) {
 		// 	textStyle{text: strings.Repeat(" ", padding)},
 		// 	textStyle{text: lineCol},
 		// )
-		a.status.draw(lineCol)
+		a.status.draw([]rune(lineCol))
 		return
 	}
 
-	a.status.draw(msg[0])
+	a.status.draw([]rune(msg[0]))
 }
 
 func (st *State) newLineNum(row int) string {
@@ -345,9 +353,9 @@ func (st *State) lineNumLen() int {
 
 // drawEditorLine draws the line with automatic tab expansion and syntax highlight
 func (a *App) drawEditorLine(row int, line []rune) {
-	var lineNumber string
+	var lineNumber []rune
 	if a.s.lineNumber {
-		lineNumber = a.s.newLineNum(row)
+		lineNumber = []rune(a.s.newLineNum(row))
 	}
 
 	screenLine := expandTabs(line)
@@ -363,7 +371,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		}
 		if screenCol < a.s.left {
 			screenLine = nil
-			a.editor[row-a.s.top].draw("")
+			a.editor[row-a.s.top].draw(nil)
 		}
 	}
 
@@ -378,9 +386,9 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		}
 		a.editor[row-a.s.top].drawText(
 			textStyle{text: lineNumber, style: styleComment},
-			textStyle{text: string(screenLine[:start])},
-			textStyle{text: string(screenLine[start:end]), style: styleHighlight},
-			textStyle{text: string(screenLine[end:])},
+			textStyle{text: screenLine[:start]},
+			textStyle{text: screenLine[start:end], style: styleHighlight},
+			textStyle{text: screenLine[end:]},
 		)
 		return
 	}
@@ -388,7 +396,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 		a.editor[row-a.s.top].drawText(
 			textStyle{text: lineNumber, style: styleComment},
-			textStyle{text: string(screenLine), style: styleBase},
+			textStyle{text: screenLine, style: styleBase},
 		)
 		return
 	}
@@ -410,7 +418,7 @@ func (a *App) drawEditor() {
 
 	for i, lineView := range a.editor {
 		if i >= remainLines {
-			lineView.draw("")
+			lineView.draw(nil)
 			continue
 		}
 		line := e.Value.([]rune)
@@ -547,7 +555,7 @@ func main() {
 					app.s.optionIdx = -1 // no selected option by default
 					ts := make([]textStyle, 0, len(app.s.options))
 					for _, option := range app.s.options {
-						ts = append(ts, textStyle{text: option + " "})
+						ts = append(ts, textStyle{text: []rune(option + " ")})
 					}
 					app.status.drawText(ts...)
 
@@ -695,80 +703,82 @@ func (a *App) handleClick(x, y int) {
 			if tabName == "" {
 				tabName = "untitled"
 			}
-			totalTabWidth += len(tabName) + len(labelClose)
+			totalTabWidth += len(tabName) + len(labelClose) + 2
 		}
-		padding := max(0, a.tab.w-totalTabWidth-len(labelNew)-len(labelOpen)-len(labelSave)-len(labelQuit))
-
-		// special labels area
-		specialLabelsStart := a.tab.x + totalTabWidth + padding
-
-		// Check if click is in special labels area
-		if x >= specialLabelsStart {
-			// New label
-			if x < specialLabelsStart+len(labelNew) {
-				a.s.tabs = slices.Insert(a.s.tabs, a.s.activeTabIdx+1, &Tab{filename: "", lines: list.New()})
-				a.s.switchTab(a.s.activeTabIdx + 1)
-				a.draw()
-				return
-			}
-			// Open label
-			if x < specialLabelsStart+len(labelNew)+len(labelOpen) {
-				a.s.focus = focusConsole
-				a.setConsole(">open ")
-				a.syncCursor()
-				return
-			}
-			// Save label
-			if x < specialLabelsStart+len(labelNew)+len(labelOpen)+len(labelSave) {
-				if len(a.s.tabs) > 0 && a.s.activeTabIdx < len(a.s.tabs) {
-					a.cmdCh <- ">save " + a.s.filename
+		sep := " "
+		menuS := strings.Join(menu, sep)
+		padding := max(0, a.tab.w-totalTabWidth-len(menuS))
+		// click menu
+		menuStart := a.tab.x + totalTabWidth + padding
+		if x >= menuStart {
+			start := menuStart
+			end := 0
+			for _, label := range menu {
+				end = start + len(label)
+				if x < start || x >= end {
+					start = end + len(sep) // separator
+					continue
 				}
-				return
-			}
-			// Quit label
-			if x < specialLabelsStart+len(labelNew)+len(labelOpen)+len(labelSave)+len(labelQuit) {
-				close(a.done)
-				return
+				switch label {
+				case labelNew:
+					a.s.tabs = slices.Insert(a.s.tabs, a.s.activeTabIdx+1, &Tab{filename: "", lines: list.New()})
+					a.s.switchTab(a.s.activeTabIdx + 1)
+					a.draw()
+					return
+				case labelOpen:
+					a.s.focus = focusConsole
+					a.setConsole(">open ")
+					a.syncCursor()
+					return
+				case labelSave:
+					if len(a.s.tabs) > 0 && a.s.activeTabIdx < len(a.s.tabs) {
+						a.cmdCh <- ">save " + a.s.filename
+					}
+					return
+				case labelQuit:
+					close(a.done)
+					return
+				}
 			}
 			return
 		}
 
-		// Check tabs - only if click is in tabs area (not in special labels)
+		// click tabs
 		if x < a.tab.x+totalTabWidth {
-			var currentWidth int
+			nameStart := a.tab.x
 			for i, tab := range a.s.tabs {
 				tabName := tab.filename
 				if tabName == "" {
 					tabName = "untitled"
 				}
-
-				tabStart := a.tab.x + currentWidth
-				tabEnd := tabStart + len(tabName)
-				closerEnd := tabEnd + len(labelClose)
-
-				// Check if click is within this tab's area
-				if x >= tabStart && x < closerEnd {
-					if x < tabEnd {
-						// Clicked on tab name - switch tab
-						if i != a.s.activeTabIdx {
-							a.s.switchTab(i)
-							a.s.focus = focusEditor
-							a.draw()
-						}
-					} else {
-						// Clicked on tab closer - close tab
-						a.s.closeTab(i)
-						if len(a.s.tabs) == 0 {
-							close(a.done)
-							return
-						}
+				nameEnd := nameStart
+				for _, char := range tabName {
+					nameEnd += runewidth.RuneWidth(char)
+				}
+				// A separator following a tab name is considered part of the name.
+				nameEnd += 1
+				closerEnd := nameEnd + len(labelClose)
+				if x < nameEnd {
+					// switch tab
+					if i != a.s.activeTabIdx {
+						a.s.switchTab(i)
 						a.s.focus = focusEditor
 						a.draw()
 					}
 					return
+				} else if x < closerEnd {
+					// close tab
+					a.s.closeTab(i)
+					if len(a.s.tabs) == 0 {
+						close(a.done)
+						return
+					}
+					a.s.focus = focusEditor
+					a.draw()
+					return
 				}
-
-				currentWidth += len(tabName) + len(labelClose)
+				// A separator following a tab closer is considered part of the next tab's name.
+				nameStart = closerEnd + 1
 			}
 		}
 		return
@@ -827,9 +837,9 @@ func (a *App) setConsole(s string, hint ...string) {
 	a.s.console = []rune(s)
 	a.s.consoleCursor = len(a.s.console)
 	if len(hint) == 0 {
-		a.console.draw(s)
+		a.console.draw(a.s.console)
 	} else {
-		a.console.drawText(textStyle{text: s}, textStyle{text: hint[0], style: styleComment})
+		a.console.drawText(textStyle{text: a.s.console}, textStyle{text: []rune(hint[0]), style: styleComment})
 	}
 }
 
@@ -893,7 +903,7 @@ func (a *App) jump(row, col int) {
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	defer func() {
-		a.console.draw(string(a.s.console))
+		a.console.draw(a.s.console)
 		a.syncCursor()
 	}()
 	exitConsole := func() {
@@ -963,7 +973,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			keyword := string(a.s.console[1:])
 			if len(keyword) == 0 {
 				a.s.options = nil
-				a.status.draw("")
+				a.status.draw(nil)
 				return
 			}
 			var filter []string
@@ -980,7 +990,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			if len(filter) == 0 {
 				a.s.options = nil
-				a.status.draw("")
+				a.status.draw(nil)
 				return
 			}
 			slices.Sort(filter)
@@ -1008,7 +1018,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			if len(filter) == 0 {
 				a.s.options = nil
-				a.status.draw("")
+				a.status.draw(nil)
 				return
 			}
 			j := 0
@@ -1025,9 +1035,9 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		ts := make([]textStyle, 0, len(a.s.options))
 		for i, option := range a.s.options {
 			if i == a.s.optionIdx {
-				ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+				ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
 			} else {
-				ts = append(ts, textStyle{text: option + " "})
+				ts = append(ts, textStyle{text: []rune(option + " ")})
 			}
 		}
 		a.status.drawText(ts...)
@@ -1056,7 +1066,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			if len(filter) == 0 {
 				a.s.options = nil
-				a.status.draw("")
+				a.status.draw(nil)
 				return
 			}
 			slices.Sort(filter)
@@ -1073,9 +1083,9 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			ts := make([]textStyle, 0, len(a.s.options))
 			for i, option := range a.s.options {
 				if i == a.s.optionIdx {
-					ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+					ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
 				} else {
-					ts = append(ts, textStyle{text: option + " "})
+					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
 			a.status.drawText(ts...)
@@ -1092,7 +1102,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			if len(filter) == 0 {
 				a.s.options = nil
-				a.status.draw("")
+				a.status.draw(nil)
 				return
 			}
 			j := 0
@@ -1108,9 +1118,9 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			ts := make([]textStyle, 0, len(a.s.options))
 			for i, option := range a.s.options {
 				if i == a.s.optionIdx {
-					ts = append(ts, textStyle{text: option + " ", style: styleHighlight})
+					ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
 				} else {
-					ts = append(ts, textStyle{text: option + " "})
+					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
 			a.status.drawText(ts...)
@@ -1126,7 +1136,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		}
 		ts := make([]textStyle, 0, len(a.s.options))
 		for _, option := range a.s.options {
-			ts = append(ts, textStyle{text: option + " "})
+			ts = append(ts, textStyle{text: []rune(option + " ")})
 		}
 		ts[a.s.optionIdx].style = styleHighlight
 		a.status.drawText(ts...)
@@ -1219,7 +1229,7 @@ func (a *App) handleCommand(cmd string) {
 			lines := list.New()
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
-				lines.PushBack(scanner.Text())
+				lines.PushBack([]rune(scanner.Text()))
 			}
 			if err := scanner.Err(); err != nil {
 				log.Print(err)
@@ -1246,7 +1256,7 @@ func (a *App) handleCommand(cmd string) {
 			// append newline at end of file
 			if len(content) == 0 || content[len(content)-1] != "" {
 				content = append(content, "")
-				a.s.lines.PushBack("")
+				a.s.lines.PushBack([]rune{})
 				a.drawEditor()
 			}
 			err := os.WriteFile(filename, []byte(strings.Join(content, "\n")), 0644)
@@ -1499,7 +1509,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.redoStack = nil
 		if e := a.s.line(a.s.row); e == nil {
 			// file end
-			a.s.lines.PushBack("")
+			a.s.lines.PushBack([]rune{})
 		} else {
 			// break the line
 			// a Enter may comes from paste, do not auto-indent
@@ -1866,7 +1876,7 @@ func (st *State) insertAt(s string, row, col int) {
 
 	e := st.line(row)
 	if e == nil {
-		e = st.lines.PushBack("")
+		e = st.lines.PushBack([]rune{})
 	}
 
 	lines := strings.Split(s, "\n")
@@ -2226,11 +2236,11 @@ func highlightGoLine(line string) []textStyle {
 		if word.Len() > 0 {
 			w := word.String()
 			if token.IsKeyword(w) {
-				parts = append(parts, textStyle{text: w, style: styleKeyword})
+				parts = append(parts, textStyle{text: []rune(w), style: styleKeyword})
 			} else if _, err := strconv.ParseFloat(w, 64); err == nil && !strings.Contains(w, " ") {
-				parts = append(parts, textStyle{text: w, style: styleNumber})
+				parts = append(parts, textStyle{text: []rune(w), style: styleNumber})
 			} else {
-				parts = append(parts, textStyle{text: w, style: styleBase})
+				parts = append(parts, textStyle{text: []rune(w), style: styleBase})
 			}
 			word.Reset()
 		}
@@ -2241,7 +2251,7 @@ func highlightGoLine(line string) []textStyle {
 		// Line comment
 		if !inString && c == '/' && i+1 < len(runes) && runes[i+1] == '/' {
 			flushWord()
-			parts = append(parts, textStyle{text: string(runes[i:]), style: styleComment})
+			parts = append(parts, textStyle{text: runes[i:], style: styleComment})
 			return parts
 		}
 
@@ -2249,7 +2259,7 @@ func highlightGoLine(line string) []textStyle {
 		if c == '"' && !inComment {
 			if inString {
 				word.WriteRune(c)
-				parts = append(parts, textStyle{text: word.String(), style: styleString})
+				parts = append(parts, textStyle{text: []rune(word.String()), style: styleString})
 				word.Reset()
 				inString = false
 			} else {
@@ -2270,7 +2280,7 @@ func highlightGoLine(line string) []textStyle {
 			word.WriteRune(c)
 		} else {
 			flushWord()
-			parts = append(parts, textStyle{text: string(c), style: styleBase})
+			parts = append(parts, textStyle{text: []rune{c}, style: styleBase})
 		}
 	}
 
