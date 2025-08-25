@@ -39,7 +39,7 @@ type App struct {
 type State struct {
 	*Tab          // active tab
 	tabs          []*Tab
-	activeTabIdx  int
+	tabIdx        int    // index of active tab
 	status        string // Status message displayed in the status bar
 	console       []rune // Console input text
 	consoleCursor int    // Cursor position in the console
@@ -52,15 +52,15 @@ type State struct {
 }
 
 type Tab struct {
-	filename     string
-	lines        *list.List          // element is rune slice
-	row          int                 // Current row position (starts from 0)
-	col          int                 // Current column position (starts from 0)
-	top          int                 // vertical scroll  (starts from 0)
-	left         int                 // horizontal scroll  (starts from 0)
-	upDownCol    int                 // Column to maintain while navigating up/down
-	symbols      map[string][]Symbol // symbol name to list of symbols
-	completion   string
+	filename  string
+	lines     *list.List          // element is rune slice
+	row       int                 // Current row position (starts from 0)
+	col       int                 // Current column position (starts from 0)
+	top       int                 // vertical scroll  (starts from 0)
+	left      int                 // horizontal scroll  (starts from 0)
+	upDownCol int                 // Column to maintain while navigating up/down
+	symbols   map[string][]Symbol // symbol name to list of symbols
+	// completion   string
 	selecting    bool
 	selection    *Selection
 	undoStack    []Edit
@@ -103,7 +103,7 @@ func (st *State) switchTab(i int) {
 		return
 	}
 
-	st.activeTabIdx = i
+	st.tabIdx = i
 	st.Tab = st.tabs[i]
 }
 
@@ -280,8 +280,9 @@ func (a *App) drawTabs() {
 		} else {
 			name = filepath.Base(tab.filename)
 		}
-		if i == a.s.activeTabIdx {
-			ts = append(ts, textStyle{text: []rune(name), style: a.tab.style.Bold(true).Underline(true).Italic(true)})
+		if i == a.s.tabIdx {
+			highlight := a.tab.style.Bold(true).Underline(true).Italic(true)
+			ts = append(ts, textStyle{text: []rune(name), style: highlight})
 		} else {
 			ts = append(ts, textStyle{text: []rune(name)})
 		}
@@ -531,7 +532,7 @@ func main() {
 					continue
 				}
 				if ev.Key() == tcell.KeyCtrlW {
-					app.s.closeTab(app.s.activeTabIdx)
+					app.s.closeTab(app.s.tabIdx)
 					if len(app.s.tabs) == 0 {
 						close(app.done)
 						return
@@ -723,8 +724,8 @@ func (a *App) handleClick(x, y int) {
 				}
 				switch label {
 				case labelNew:
-					a.s.tabs = slices.Insert(a.s.tabs, a.s.activeTabIdx+1, &Tab{filename: "", lines: list.New()})
-					a.s.switchTab(a.s.activeTabIdx + 1)
+					a.s.tabs = slices.Insert(a.s.tabs, a.s.tabIdx+1, &Tab{filename: "", lines: list.New()})
+					a.s.switchTab(a.s.tabIdx + 1)
 					a.draw()
 					return
 				case labelOpen:
@@ -733,7 +734,7 @@ func (a *App) handleClick(x, y int) {
 					a.syncCursor()
 					return
 				case labelSave:
-					if len(a.s.tabs) > 0 && a.s.activeTabIdx < len(a.s.tabs) {
+					if len(a.s.tabs) > 0 && a.s.tabIdx < len(a.s.tabs) {
 						a.cmdCh <- ">save " + a.s.filename
 					}
 					return
@@ -762,7 +763,7 @@ func (a *App) handleClick(x, y int) {
 				closerEnd := nameEnd + len(labelClose)
 				if x < nameEnd {
 					// switch tab
-					if i != a.s.activeTabIdx {
+					if i != a.s.tabIdx {
 						a.s.switchTab(i)
 						a.s.focus = focusEditor
 						a.draw()
@@ -841,7 +842,10 @@ func (a *App) setConsole(s string, hint ...string) {
 	if len(hint) == 0 {
 		a.console.draw(a.s.console)
 	} else {
-		a.console.drawText(textStyle{text: a.s.console}, textStyle{text: []rune(hint[0]), style: styleComment})
+		a.console.drawText(
+			textStyle{text: a.s.console},
+			textStyle{text: []rune(hint[0]), style: styleComment},
+		)
 	}
 }
 
@@ -1167,22 +1171,22 @@ func (st *State) closeTab(index int) {
 
 	st.tabs = slices.Delete(st.tabs, index, index+1)
 	if len(st.tabs) == 0 {
-		st.activeTabIdx = 0
+		st.tabIdx = 0
 		return
 	}
 
 	switch {
-	case index < st.activeTabIdx:
+	case index < st.tabIdx:
 		// Closed tab was before current tab, shift index left
-		st.activeTabIdx--
-	case index == st.activeTabIdx:
+		st.tabIdx--
+	case index == st.tabIdx:
 		// Closed the current tab, need to select a new one
-		if st.activeTabIdx >= len(st.tabs) {
-			st.activeTabIdx = len(st.tabs) - 1
+		if st.tabIdx >= len(st.tabs) {
+			st.tabIdx = len(st.tabs) - 1
 		}
 		// Switch to the tab now at the current index (could be same position, new tab)
-		st.switchTab(st.activeTabIdx)
-	case index > st.activeTabIdx:
+		st.switchTab(st.tabIdx)
+	case index > st.tabIdx:
 		// Closed tab was after current tab, no index adjustment needed
 	}
 }
@@ -1346,7 +1350,12 @@ func (a *App) handleCommand(cmd string) {
 			if i := strings.Index(strings.ToLower(line[col:]), strings.ToLower(string(keyword))); i >= 0 {
 				a.recordPositon(a.s.row, a.s.col)
 				a.jump(row, col+i+len(keyword))
-				a.s.selection = &Selection{startRow: row, endRow: row, startCol: col + i, endCol: col + i + len(keyword)}
+				a.s.selection = &Selection{
+					startRow: row,
+					endRow:   row,
+					startCol: col + i,
+					endCol:   col + i + len(keyword),
+				}
 				a.setConsole(cmd) // incremental search
 				a.draw()
 				return
@@ -1503,9 +1512,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		})
 		a.drawEditorLine(a.s.row, line)
 		a.jump(a.s.row, a.s.col+1)
-	case tcell.KeyEnter, tcell.KeyCtrlJ:
-		// for line breaks on pasting multiple lines,
-		// macOS Terminal and iTerm2 sends Enter, kitty sends Ctrl-J
+	case tcell.KeyEnter:
 		a.s.lastEdit = nil
 		a.s.undoStack = nil
 		a.s.redoStack = nil
