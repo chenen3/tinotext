@@ -2,6 +2,12 @@
 
 A mini text editor around 2000 lines of code.
 
+Usage:
+```
+go build -o seyi .
+./seyi <filename>
+```
+
 Key bindings:
 ```
 ctrl-w close
@@ -19,3 +25,4 @@ ctrl-z undo
 ctrl-y redo
 ctrl-_ go back
 ```
+

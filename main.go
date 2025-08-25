@@ -1440,6 +1440,17 @@ func (a *App) syncCursor() {
 	}
 }
 
+func leadingWhitespaces(line []rune) int {
+	for i, r := range line {
+		if r != ' ' && r != '\t' {
+			return i
+		}
+	}
+	return len(line)
+}
+
+var timeLastKey time.Time
+
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
@@ -1447,6 +1458,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
 			a.s.upDownCol = -1
 		}
+		timeLastKey = time.Now()
 	}()
 	switch ev.Key() {
 	case tcell.KeyCtrlZ:
@@ -1455,6 +1467,31 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyCtrlY:
 		a.s.redo()
 		a.drawEditor()
+	case tcell.KeyCtrlA:
+		e := a.s.line(a.s.row)
+		if e == nil {
+			return
+		}
+		a.jump(a.s.row, leadingWhitespaces(e.Value.([]rune)))
+	case tcell.KeyCtrlE:
+		a.jump(a.s.row, -1)
+	case tcell.KeyBacktab:
+		e := a.s.line(a.s.row)
+		if e == nil {
+			return
+		}
+		line := e.Value.([]rune)
+		if len(line) > 0 && line[0] == '\t' {
+			e.Value = line[1:]
+			a.drawEditorLine(a.s.row, line[1:])
+			a.s.col--
+			a.s.recordEdit(Edit{
+				row:     a.s.row,
+				col:     0,
+				oldText: "\t",
+				kind:    editDelete,
+			})
+		}
 	case tcell.KeyRune:
 		var line []rune
 		e := a.s.line(a.s.row)
@@ -1521,11 +1558,18 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.lines.PushBack([]rune{})
 		} else {
 			// break the line
-			// a Enter may comes from paste, do not auto-indent
 			line := e.Value.([]rune)
-			a.s.lines.InsertAfter(line[a.s.col:], e)
+			n := leadingWhitespaces(line[:a.s.col])
+			// TODO: distinct Enter from keyboard and clipboard
+			if n == 0 || time.Since(timeLastKey) < 10*time.Millisecond {
+				a.s.lines.InsertAfter(line[a.s.col:], e)
+			} else {
+				// auto-indent
+				newLine := slices.Concat(line[:n], line[a.s.col:])
+				a.s.lines.InsertAfter(newLine, e)
+			}
 			e.Value = line[:a.s.col]
-			a.s.col = 0
+			a.s.col = n
 		}
 		a.s.row++
 		a.jump(a.s.row, a.s.col)
