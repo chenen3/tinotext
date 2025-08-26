@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -542,19 +543,49 @@ func main() {
 				}
 				// quickly open file in current folder
 				if ev.Key() == tcell.KeyCtrlO {
-					// keep it simple, don't read the folder recursively
-					entries, err := os.ReadDir(".")
+					var git bool
+					root, err := filepath.Abs(".")
 					if err != nil {
 						log.Print(err)
 						continue
 					}
-					app.s.files = nil
+					entries, err := os.ReadDir(root)
+					if err != nil {
+						log.Print(err)
+						continue
+					}
 					for _, entry := range entries {
-						if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-							app.s.files = append(app.s.files, entry.Name())
+						if entry.IsDir() && entry.Name() == ".git" {
+							git = true
+							break
 						}
 					}
-					app.s.options = app.s.files
+					if !git {
+						// only read sub-folder recursively for git project
+						continue
+					}
+
+					var files []string
+					err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+						if strings.HasPrefix(d.Name(), ".") && d.IsDir() {
+							return filepath.SkipDir
+						}
+						if strings.HasPrefix(d.Name(), ".") || d.IsDir() {
+							return nil
+						}
+						rel, err := filepath.Rel(root, path)
+						if err != nil {
+							return err
+						}
+						files = append(files, rel)
+						return nil
+					})
+					if err != nil {
+						log.Print(err)
+						continue
+					}
+					app.s.files = files
+					app.s.options = files
 					app.s.optionIdx = -1 // no selected option by default
 					ts := make([]textStyle, 0, len(app.s.options))
 					for _, option := range app.s.options {
@@ -1281,9 +1312,6 @@ func (a *App) handleCommand(cmd string) {
 			a.s.focus = focusEditor
 			a.jump(a.s.row, a.s.col)
 			a.drawEditor()
-		case "bottom":
-			a.s.focus = focusEditor
-			a.jump(-1, -1)
 		case "back":
 			a.s.focus = focusEditor
 			a.goBack()
@@ -1294,17 +1322,22 @@ func (a *App) handleCommand(cmd string) {
 			a.drawStatus("unknown command: " + cmd)
 		}
 	case ':': // go to line
-		line, err := strconv.Atoi(cmd[1:])
+		a.s.focus = focusEditor
+		defer a.syncCursor()
+		n, err := strconv.Atoi(cmd[1:])
 		if err != nil {
 			a.drawStatus("Invalid line number")
 			return
 		}
-		if line < 1 || line > a.s.lines.Len() {
+		if n > a.s.lines.Len() {
 			a.drawStatus("Line number out of range")
 			return
 		}
-		a.s.focus = focusEditor
-		a.jump(line-1, 0)
+		if n < 0 {
+			// input -1, scroll to bottom line
+			n = a.s.lines.Len()
+		}
+		a.jump(n-1, 0)
 	case '@': // go to symbol
 		name := cmd[1:]
 		var receiver string
@@ -1467,14 +1500,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyCtrlY:
 		a.s.redo()
 		a.drawEditor()
-	case tcell.KeyCtrlA:
-		e := a.s.line(a.s.row)
-		if e == nil {
-			return
-		}
-		a.jump(a.s.row, leadingWhitespaces(e.Value.([]rune)))
-	case tcell.KeyCtrlE:
-		a.jump(a.s.row, -1)
 	case tcell.KeyBacktab:
 		e := a.s.line(a.s.row)
 		if e == nil {
@@ -1550,29 +1575,43 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.drawEditorLine(a.s.row, line)
 		a.jump(a.s.row, a.s.col+1)
 	case tcell.KeyEnter:
-		a.s.lastEdit = nil
-		a.s.undoStack = nil
-		a.s.redoStack = nil
-		if e := a.s.line(a.s.row); e == nil {
+		e := a.s.line(a.s.row)
+		if e == nil {
 			// file end
 			a.s.lines.PushBack([]rune{})
-		} else {
-			// break the line
-			line := e.Value.([]rune)
-			n := leadingWhitespaces(line[:a.s.col])
-			// TODO: distinct Enter from keyboard and clipboard
-			if n == 0 || time.Since(timeLastKey) < 10*time.Millisecond {
-				a.s.lines.InsertAfter(line[a.s.col:], e)
-			} else {
-				// auto-indent
-				newLine := slices.Concat(line[:n], line[a.s.col:])
-				a.s.lines.InsertAfter(newLine, e)
-			}
-			e.Value = line[:a.s.col]
-			a.s.col = n
+			a.s.recordEdit(Edit{
+				newText: "\n",
+				row:     a.s.row,
+				col:     a.s.col,
+				kind:    editInsert,
+			})
+			a.jump(a.s.row+1, a.s.col)
+			a.drawEditor()
+			return
 		}
-		a.s.row++
-		a.jump(a.s.row, a.s.col)
+
+		// break the line, add indentation for the Enter from keyboard
+		line := e.Value.([]rune)
+		n := leadingWhitespaces(line[:a.s.col])
+		var indent []rune
+		if time.Since(timeLastKey) > 10*time.Millisecond {
+			if len(line) > 1 && line[a.s.col-1] == '{' {
+				n++
+			}
+			indent = make([]rune, n)
+			for i := range n {
+				indent[i] = '\t'
+			}
+		}
+		a.s.recordEdit(Edit{
+			newText: "\n" + string(indent),
+			row:     a.s.row,
+			col:     a.s.col,
+			kind:    editInsert,
+		})
+		a.s.lines.InsertAfter(slices.Concat(indent, line[a.s.col:]), e)
+		e.Value = line[:a.s.col]
+		a.jump(a.s.row+1, n)
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		// delete selection
@@ -1733,7 +1772,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.col = min(len(line), a.s.col)
 		}
 		a.jump(a.s.row, a.s.col)
-	case tcell.KeyHome:
+	case tcell.KeyHome, tcell.KeyCtrlA:
 		a.s.lastEdit = nil
 		a.unselect()
 
@@ -1742,15 +1781,8 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if line == nil {
 			return
 		}
-		text := line.Value.([]rune)
-		for i, r := range text {
-			if r != ' ' && r != '\t' {
-				a.s.col = i
-				break
-			}
-		}
-		a.jump(a.s.row, a.s.col)
-	case tcell.KeyEnd:
+		a.jump(a.s.row, leadingWhitespaces(line.Value.([]rune)))
+	case tcell.KeyEnd, tcell.KeyCtrlE:
 		a.s.lastEdit = nil
 		a.unselect()
 		a.jump(a.s.row, -1)
