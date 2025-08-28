@@ -355,11 +355,21 @@ func (st *State) lineNumLen() int {
 	return length + 2 // padding
 }
 
-// drawEditorLine draws the line with automatic tab expansion and syntax highlight
+// drawEditorLine draws the line with automatic tab expansion and syntax highlight,
+// highlights the line number in the gutter if necessary.
 func (a *App) drawEditorLine(row int, line []rune) {
-	var lineNumber []rune
+	if row < a.s.top || row >= a.s.top+len(a.editor) {
+		// out of viewport
+		return
+	}
+
+	var lineNumber textStyle
 	if a.s.lineNumber {
-		lineNumber = []rune(a.s.newLineNum(row))
+		lineNumber.text = []rune(a.s.newLineNum(row))
+		lineNumber.style = styleComment
+		if row == a.s.row {
+			lineNumber.style = styleBase.Background(tcell.ColorLightGray)
+		}
 	}
 
 	screenLine := expandTabs(line)
@@ -389,7 +399,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			end = columnToVisual(line, sel.endCol)
 		}
 		a.editor[row-a.s.top].drawText(
-			textStyle{text: lineNumber, style: styleComment},
+			lineNumber,
 			textStyle{text: screenLine[:start]},
 			textStyle{text: screenLine[start:end], style: styleHighlight},
 			textStyle{text: screenLine[end:]},
@@ -399,7 +409,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 
 	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
 		a.editor[row-a.s.top].drawText(
-			textStyle{text: lineNumber, style: styleComment},
+			lineNumber,
 			textStyle{text: screenLine, style: styleBase},
 		)
 		return
@@ -408,7 +418,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 	// syntax highlight
 	parts := highlightGoLine(screenLine)
 	s := make([]textStyle, 0, len(parts)+1)
-	s = append(s, textStyle{text: lineNumber, style: styleComment})
+	s = append(s, lineNumber)
 	s = append(s, parts...)
 	a.editor[row-a.s.top].drawText(s...)
 }
@@ -463,13 +473,10 @@ func main() {
 	screen = s
 
 	quit := func() {
-		// You have to catch panics in a defer, clean up, and
-		// re-raise them - otherwise your application can
-		// die without leaving any diagnostic trace.
-		maybePanic := recover()
+		err := recover()
 		s.Fini()
-		if maybePanic != nil {
-			panic(maybePanic)
+		if err != nil {
+			panic(err)
 		}
 	}
 	defer quit()
@@ -485,6 +492,7 @@ func main() {
 			filename: "",
 			lines:    list.New(),
 		}},
+		lineNumber: true,
 	}
 	app.s.Tab = app.s.tabs[0]
 	if len(os.Args) >= 2 {
@@ -567,6 +575,9 @@ func main() {
 
 					var files []string
 					err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+						if err != nil {
+							return err
+						}
 						if strings.HasPrefix(d.Name(), ".") && d.IsDir() {
 							return filepath.SkipDir
 						}
@@ -839,8 +850,7 @@ func (a *App) handleClick(x, y int) {
 		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
 		col := columnFromScreenWidth(line, screenCol)
 		a.recordPositon(a.s.row, a.s.col)
-		a.s.row = row
-		a.s.col = col
+		a.jump(row, col)
 	}
 
 	if !a.s.selecting {
@@ -857,8 +867,7 @@ func (a *App) handleClick(x, y int) {
 	}
 
 	a.drawStatus()
-	a.drawEditor()
-	a.syncCursor()
+	a.drawEditor()     // render selection
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
 	if line := a.s.line(a.s.row); line != nil {
@@ -879,6 +888,8 @@ func (a *App) setConsole(s string, hint ...string) {
 		)
 	}
 }
+
+var prevLineNum int
 
 // jump moves the cursor to the specified line and column,
 // If row less than 0, jump to the last line.
@@ -934,6 +945,15 @@ func (a *App) jump(row, col int) {
 
 	if scroll {
 		a.drawEditor()
+	} else {
+		// highlight current line number, cancel previous
+		a.drawEditorLine(row, line)
+		if row != prevLineNum && (a.s.top <= prevLineNum && prevLineNum < a.s.top+len(a.editor)) {
+			if e := a.s.line(prevLineNum); e != nil {
+				a.drawEditorLine(prevLineNum, e.Value.([]rune))
+			}
+		}
+		prevLineNum = row
 	}
 	a.syncCursor()
 }
@@ -1303,7 +1323,9 @@ func (a *App) handleCommand(cmd string) {
 			} else {
 				a.drawStatus("File saved as: " + filename)
 				a.s.filename = filename // update current tab
+				a.drawTabs()
 				a.s.focus = focusEditor
+				a.syncCursor()
 			}
 		case "linenumber":
 			// toogle line number display
@@ -1411,8 +1433,6 @@ func (a *App) commandLoop() {
 	}
 }
 
-var prevHighlightLine int
-
 // syncCursor sync cursor position and show it.
 // when rendering line highlight, call this method after editor redraw.
 func (a *App) syncCursor() {
@@ -1439,24 +1459,6 @@ func (a *App) syncCursor() {
 			return
 		}
 		screen.ShowCursor(x, y)
-
-		if sel := a.s.selected(); sel != nil && sel.startRow <= a.s.row && a.s.row <= sel.endRow {
-			return
-		}
-		// Render current line highlight
-		w, _ := screen.Size()
-		for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
-			r, _, style, _ := screen.GetContent(x, y)
-			screen.SetContent(x, y, r, nil, style.Background(tcell.ColorLightYellow))
-		}
-		if a.s.row != prevHighlightLine {
-			prevY := a.editor[0].y + prevHighlightLine - a.s.top
-			for x := a.editor[0].x + a.s.lineNumLen(); x < w; x++ {
-				r, _, style, _ := screen.GetContent(x, prevY)
-				screen.SetContent(x, prevY, r, nil, style.Background(tcell.ColorWhite))
-			}
-			prevHighlightLine = a.s.row
-		}
 	case focusConsole:
 		// Calculate visual width of console text up to cursor
 		consoleRunes := []rune(a.s.console)
@@ -1592,10 +1594,10 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		// break the line, add indentation for the Enter from keyboard
 		line := e.Value.([]rune)
-		n := leadingWhitespaces(line[:a.s.col])
 		var indent []rune
-		if time.Since(timeLastKey) > 10*time.Millisecond {
-			if len(line) > 1 && line[a.s.col-1] == '{' {
+		if a.s.col > 0 && time.Since(timeLastKey) > 10*time.Millisecond {
+			n := leadingWhitespaces(line[:a.s.col])
+			if line[a.s.col-1] == '{' {
 				n++
 			}
 			indent = make([]rune, n)
@@ -1611,7 +1613,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		})
 		a.s.lines.InsertAfter(slices.Concat(indent, line[a.s.col:]), e)
 		e.Value = line[:a.s.col]
-		a.jump(a.s.row+1, n)
+		a.jump(a.s.row+1, len(indent))
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		// delete selection
@@ -1697,7 +1699,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		// command+right go to the end of line, works in kitty
 		if ev.Modifiers()&tcell.ModMeta != 0 {
 			a.jump(a.s.row, -1)
 			return
@@ -1726,7 +1727,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return // already at the top
 		}
 
-		// command+up go to the start of file, works in kitty
 		if ev.Modifiers()&tcell.ModMeta != 0 {
 			a.jump(0, 0)
 			return
@@ -1753,7 +1753,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return // already at the bottom
 		}
 
-		// command+down go to the end of file, works in kitty
 		if ev.Modifiers()&tcell.ModMeta != 0 {
 			a.jump(-1, -1)
 			return
@@ -1917,7 +1916,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			})
 		}
 		a.drawEditor()
-	case tcell.KeyCtrlUnderscore: // does not work in kitty
+	case tcell.KeyCtrlUnderscore:
 		a.goBack()
 	case tcell.KeyEscape:
 		a.s.selection = nil
