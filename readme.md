@@ -26,5 +26,5 @@ ctrl-y redo
 ctrl-_ go back
 ctrl-a start of line
 ctrl-e end of line
-shift-tab decrease indentation
+shift-tab decrease indent
 ```

@@ -2,13 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"container/list"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io"
 	"io/fs"
+
 	"log"
 	"os"
 	"path/filepath"
@@ -501,16 +504,13 @@ func main() {
 		f, err := os.Open(filename)
 		if err != nil {
 			log.Print(err)
-
-		} else {
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				app.s.lines.PushBack([]rune(scanner.Text()))
-			}
-			if err := scanner.Err(); err != nil {
-				log.Print(err)
-			}
-			f.Close()
+			return
+		}
+		err = app.load(f)
+		f.Close()
+		if err != nil {
+			log.Print(err)
+			return
 		}
 	}
 
@@ -1284,11 +1284,8 @@ func (a *App) handleCommand(cmd string) {
 			}
 			defer file.Close()
 			lines := list.New()
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				lines.PushBack([]rune(scanner.Text()))
-			}
-			if err := scanner.Err(); err != nil {
+			err = a.load(file)
+			if err != nil {
 				log.Print(err)
 				a.drawStatus(err.Error())
 				return
@@ -1306,17 +1303,25 @@ func (a *App) handleCommand(cmd string) {
 				return
 			}
 			filename := c[1]
-			content := make([]string, 0, a.s.lines.Len())
+			lines := make([]string, 0, a.s.lines.Len()+1)
 			for e := a.s.lines.Front(); e != nil; e = e.Next() {
-				content = append(content, string(e.Value.([]rune)))
+				lines = append(lines, string(e.Value.([]rune)))
 			}
-			// append newline at end of file
-			if len(content) == 0 || content[len(content)-1] != "" {
-				content = append(content, "")
-				a.s.lines.PushBack([]rune{})
-				a.drawEditor()
+			// ensure a single newline at the end of file
+			if len(lines) == 0 || lines[len(lines)-1] != "" {
+				lines = append(lines, "")
 			}
-			err := os.WriteFile(filename, []byte(strings.Join(content, "\n")), 0644)
+			src := []byte(strings.Join(lines, "\n"))
+			// format on save
+			if filepath.Ext(filename) == ".go" {
+				bs, err := format.Source(src)
+				if err != nil {
+					a.drawStatus(err.Error())
+					return
+				}
+				src = bs
+			}
+			err := os.WriteFile(filename, src, 0644)
 			if err != nil {
 				log.Printf("Failed to save file %s: %v", filename, err)
 				a.drawStatus("Failed to save file: " + err.Error())
@@ -1325,6 +1330,13 @@ func (a *App) handleCommand(cmd string) {
 				a.s.filename = filename // update current tab
 				a.drawTabs()
 				a.s.focus = focusEditor
+				if err := a.load(bytes.NewReader(src)); err != nil {
+					a.drawStatus(err.Error())
+					return
+				}
+				a.s.row = min(a.s.row, a.s.lines.Len()-1)
+				a.s.col = 0
+				a.drawEditor()
 				a.syncCursor()
 			}
 		case "linenumber":
@@ -1582,7 +1594,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if a.s.col == 0 || time.Since(timeLastKey) < 10*time.Millisecond {
 			a.s.lines.InsertAfter(line[a.s.col:], e)
 			a.s.recordEdit(Edit{newText: "\n", row: a.s.row, col: a.s.col, kind: editInsert})
-			a.s.row, a.s.col = a.s.row+1, 0
+			a.jump(a.s.row+1, a.s.col)
 			a.drawEditor()
 			return
 		}
@@ -1601,13 +1613,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.lines.InsertAfter(slices.Concat(indent[:n], line[a.s.col:]), nextE)
 			inserted = "\n" + string(indent) + "\n" + string(indent[:n])
 			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
-			a.s.row, a.s.col = a.s.row+1, len(indent)
+			a.jump(a.s.row+1, len(indent))
 		} else {
 			newLine := slices.Concat(indent, line[a.s.col:])
 			a.s.lines.InsertAfter(newLine, e)
 			inserted = "\n" + string(indent)
 			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
-			a.s.row, a.s.col = a.s.row+1, len(indent)
+			a.jump(a.s.row+1, len(indent))
 		}
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
@@ -2433,4 +2445,17 @@ func highlightGoLine(line []rune) []textStyle {
 
 	flushWord()
 	return parts
+}
+
+func (a *App) load(r io.Reader) error {
+	a.s.lines.Init()
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		a.s.lines.PushBack([]rune(scanner.Text()))
+	}
+	if lastLine := a.s.lines.Back().Value.([]rune); len(lastLine) != 0 {
+		// append newline
+		a.s.lines.PushBack([]rune{})
+	}
+	return scanner.Err()
 }
