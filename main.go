@@ -1592,28 +1592,40 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		// break the line, add indentation for the Enter from keyboard
+		// break the line
 		line := e.Value.([]rune)
-		var indent []rune
-		if a.s.col > 0 && time.Since(timeLastKey) > 10*time.Millisecond {
-			n := leadingWhitespaces(line[:a.s.col])
-			if line[a.s.col-1] == '{' {
-				n++
-			}
-			indent = make([]rune, n)
-			for i := range n {
-				indent[i] = '\t'
-			}
-		}
-		a.s.recordEdit(Edit{
-			newText: "\n" + string(indent),
-			row:     a.s.row,
-			col:     a.s.col,
-			kind:    editInsert,
-		})
-		a.s.lines.InsertAfter(slices.Concat(indent, line[a.s.col:]), e)
 		e.Value = line[:a.s.col]
-		a.jump(a.s.row+1, len(indent))
+		// no auto-indent for the Enter from clipboard
+		if a.s.col == 0 || time.Since(timeLastKey) < 10*time.Millisecond {
+			a.s.lines.InsertAfter(line[a.s.col:], e)
+			a.s.recordEdit(Edit{newText: "\n", row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.row, a.s.col = a.s.row+1, 0
+			a.drawEditor()
+			return
+		}
+
+		// auto-indent
+		var inserted string
+		n := leadingWhitespaces(line[:a.s.col])
+		indent := make([]rune, 0, n)
+		for range n {
+			indent = append(indent, '\t')
+		}
+		if line[a.s.col-1] == '{' && a.s.col < len(line) && line[a.s.col] == '}' {
+			// Enter inside {}
+			indent = append(indent, '\t')
+			nextE := a.s.lines.InsertAfter(indent, e)
+			a.s.lines.InsertAfter(slices.Concat(indent[:n], line[a.s.col:]), nextE)
+			inserted = "\n" + string(indent) + "\n" + string(indent[:n])
+			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.row, a.s.col = a.s.row+1, len(indent)
+		} else {
+			newLine := slices.Concat(indent, line[a.s.col:])
+			a.s.lines.InsertAfter(newLine, e)
+			inserted = "\n" + string(indent)
+			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.row, a.s.col = a.s.row+1, len(indent)
+		}
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		// delete selection
