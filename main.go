@@ -1502,23 +1502,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 	case tcell.KeyCtrlY:
 		a.s.redo()
 		a.drawEditor()
-	case tcell.KeyBacktab:
-		e := a.s.line(a.s.row)
-		if e == nil {
-			return
-		}
-		line := e.Value.([]rune)
-		if len(line) > 0 && line[0] == '\t' {
-			e.Value = line[1:]
-			a.drawEditorLine(a.s.row, line[1:])
-			a.s.col--
-			a.s.recordEdit(Edit{
-				row:     a.s.row,
-				col:     0,
-				oldText: "\t",
-				kind:    editDelete,
-			})
-		}
 	case tcell.KeyRune:
 		var line []rune
 		e := a.s.line(a.s.row)
@@ -1798,6 +1781,34 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.unselect()
 		a.jump(a.s.row, -1)
 	case tcell.KeyTAB:
+		// increase indent for selection
+		if sel := a.s.selected(); sel != nil {
+			a.s.selection = &Selection{
+				startRow: sel.startRow,
+				startCol: sel.startCol + 1,
+				endRow:   sel.endRow,
+				endCol:   sel.endCol + 1,
+			}
+			e := a.s.line(sel.startRow)
+			for row := sel.startRow; row <= sel.endRow; row++ {
+				if e == nil {
+					break
+				}
+				line := e.Value.([]rune)
+				newLine := make([]rune, 0, len(line)+1)
+				newLine = append(newLine, '\t')
+				newLine = append(newLine, line...)
+				e.Value = newLine
+				a.drawEditorLine(row, newLine)
+				a.s.recordEdit(Edit{row: row, col: 0, newText: "\t", kind: editInsert})
+				if row == a.s.row {
+					a.s.col++
+				}
+				e = e.Next()
+			}
+			return
+		}
+
 		a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: "\t", kind: editInsert})
 		char := '\t'
 		e := a.s.line(a.s.row)
@@ -1810,6 +1821,45 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			e.Value = line
 		}
 		a.drawEditorLine(a.s.row, e.Value.([]rune))
+	case tcell.KeyBacktab:
+		// decrease indent
+		unindent := func(row int, e *list.Element) {
+			if e == nil {
+				return
+			}
+			line := e.Value.([]rune)
+			if len(line) == 0 || line[0] != '\t' {
+				return
+			}
+			e.Value = line[1:]
+			a.drawEditorLine(row, line[1:])
+			if row == a.s.row {
+				a.s.col--
+			}
+			a.s.recordEdit(Edit{
+				row:     row,
+				col:     0,
+				oldText: "\t",
+				kind:    editDelete,
+			})
+		}
+		if sel := a.s.selected(); sel != nil {
+			a.s.selection = &Selection{
+				startRow: sel.startRow,
+				startCol: sel.startCol - 1,
+				endRow:   sel.endRow,
+				endCol:   sel.endCol - 1,
+			}
+			e := a.s.line(sel.startRow)
+			for row := sel.startRow; row <= sel.endRow; row++ {
+				unindent(row, e)
+				e = e.Next()
+			}
+			return
+		}
+
+		e := a.s.line(a.s.row)
+		unindent(a.s.row, e)
 	case tcell.KeyPgUp:
 		a.unselect()
 		// go to previous page or the top of the page
@@ -2049,34 +2099,37 @@ func (st *State) selected() *Selection {
 func (st *State) deleteRange(startRow, startCol, endRow, endCol int) string {
 	var deleted strings.Builder
 	if startRow == endRow {
-		// Single-line
+		// single line
 		element := st.line(startRow)
 		line := element.Value.([]rune)
 		deleted.WriteString(string(line[startCol:endCol]))
 		line = slices.Delete(line, startCol, endCol)
 		element.Value = line
-	} else {
-		// Multi-element
-		element := st.line(startRow)
-		firstLineLeft := element.Value.([]rune)[:startCol]
-		for i := startRow; i <= endRow && element != nil; i++ {
-			line := element.Value.([]rune)
-			next := element.Next()
-			switch i {
-			case startRow:
-				deleted.WriteString(string(line[startCol:]))
-				deleted.WriteString("\n")
-				st.lines.Remove(element)
-			case endRow:
-				deleted.WriteString(string(line[:endCol]))
-				element.Value = append(firstLineLeft, line[endCol:]...)
-			default:
-				deleted.WriteString(string(line))
-				deleted.WriteString("\n")
-				st.lines.Remove(element)
-			}
-			element = next
+		st.row = startRow
+		st.col = startCol
+		return deleted.String()
+	}
+
+	// mutiple lines
+	element := st.line(startRow)
+	firstLineLeft := element.Value.([]rune)[:startCol]
+	for i := startRow; i <= endRow && element != nil; i++ {
+		line := element.Value.([]rune)
+		next := element.Next()
+		switch i {
+		case startRow:
+			deleted.WriteString(string(line[startCol:]))
+			deleted.WriteString("\n")
+			st.lines.Remove(element)
+		case endRow:
+			deleted.WriteString(string(line[:endCol]))
+			element.Value = append(firstLineLeft, line[endCol:]...)
+		default:
+			deleted.WriteString(string(line))
+			deleted.WriteString("\n")
+			st.lines.Remove(element)
 		}
+		element = next
 	}
 	st.row = startRow
 	st.col = startCol
