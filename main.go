@@ -1283,15 +1283,14 @@ func (a *App) handleCommand(cmd string) {
 				return
 			}
 			defer file.Close()
-			lines := list.New()
+			a.s.tabs = append(a.s.tabs, &Tab{filename: filename})
+			a.s.switchTab(len(a.s.tabs) - 1)
 			err = a.load(file)
 			if err != nil {
 				log.Print(err)
 				a.drawStatus(err.Error())
 				return
 			}
-			a.s.tabs = append(a.s.tabs, &Tab{filename: filename, lines: lines})
-			a.s.switchTab(len(a.s.tabs) - 1)
 			a.s.focus = focusEditor
 			a.draw()
 			return
@@ -2447,15 +2446,21 @@ func highlightGoLine(line []rune) []textStyle {
 	return parts
 }
 
+// load reads lines from r and adds them to current tab's buffer
 func (a *App) load(r io.Reader) error {
-	a.s.lines.Init()
+	var lines list.List
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		a.s.lines.PushBack([]rune(scanner.Text()))
+		lines.PushBack([]rune(scanner.Text()))
 	}
-	if lastLine := a.s.lines.Back().Value.([]rune); len(lastLine) != 0 {
+	if lastLine := lines.Back().Value.([]rune); len(lastLine) != 0 {
 		// append newline
-		a.s.lines.PushBack([]rune{})
+		lines.PushBack([]rune{})
 	}
-	return scanner.Err()
+	err := scanner.Err()
+	if err != nil {
+		return err
+	}
+	a.s.lines = &lines
+	return nil
 }
