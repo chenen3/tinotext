@@ -380,15 +380,16 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		// Adjust for horizontal scroll, accounting for rune widths
 		screenCol := 0
 		for i, r := range screenLine {
+			screenCol += runewidth.RuneWidth(r)
 			if screenCol >= a.s.left {
-				screenLine = screenLine[i:]
+				screenLine = screenLine[i+1:]
 				break
 			}
-			screenCol += runewidth.RuneWidth(r)
 		}
 		if screenCol < a.s.left {
 			screenLine = nil
-			a.editor[row-a.s.top].draw(nil)
+			a.editor[row-a.s.top].drawText(lineNumber)
+			return
 		}
 	}
 
@@ -1702,11 +1703,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.row = selection.endRow
 			a.s.col = selection.endCol
 			a.unselect()
-			return
-		}
-
-		if ev.Modifiers()&tcell.ModMeta != 0 {
-			a.jump(a.s.row, -1)
 			return
 		}
 
