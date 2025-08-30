@@ -259,7 +259,6 @@ func columnFromScreenWidth(line []rune, screenCol int) int {
 func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
-	a.drawStatus()
 	a.console.draw(a.s.console)
 	a.syncCursor()
 }
@@ -306,24 +305,6 @@ func (a *App) drawTabs() {
 	}
 	ts = append(ts, textStyle{text: []rune(menuS)})
 	a.tab.drawText(ts...)
-}
-
-// drawStatus show filename, line and column number by default.
-// If msg is provided, show the message instead.
-func (a *App) drawStatus(msg ...string) {
-	if len(msg) == 0 {
-		lineCol := fmt.Sprintf("Line %d, Column %d ", a.s.row+1, a.s.col+1)
-		// padding := max(0, a.status.w-len(a.s.filename)-len(lineCol))
-		// a.status.drawText(
-		// 	textStyle{text: a.s.filename},
-		// 	textStyle{text: strings.Repeat(" ", padding)},
-		// 	textStyle{text: lineCol},
-		// )
-		a.status.draw([]rune(lineCol))
-		return
-	}
-
-	a.status.draw([]rune(msg[0]))
 }
 
 func (st *State) newLineNum(row int) string {
@@ -397,10 +378,10 @@ func (a *App) drawEditorLine(row int, line []rune) {
 	if sel := a.s.selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
 		start, end := 0, len(screenLine)
 		if sel.startRow == row {
-			start = columnToVisual(line, sel.startCol)
+			start = columnToVisual(line, sel.startCol) - a.s.left
 		}
 		if sel.endRow == row {
-			end = columnToVisual(line, sel.endCol)
+			end = columnToVisual(line, sel.endCol) - a.s.left
 		}
 		a.editor[row-a.s.top].drawText(
 			lineNumber,
@@ -637,7 +618,7 @@ func main() {
 					}
 					symbols, err := ParseSymbol(app.s.filename, src.String())
 					if err != nil {
-						app.drawStatus("Failed to parse symbols: " + err.Error())
+						app.status.draw([]rune("Failed to parse symbols: " + err.Error()))
 						continue
 					}
 					app.s.symbols = symbols
@@ -867,7 +848,6 @@ func (a *App) handleClick(x, y int) {
 		a.s.selection.endCol = a.s.col
 	}
 
-	a.drawStatus()
 	a.drawEditor()     // render selection
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
@@ -967,7 +947,6 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 	exitConsole := func() {
 		a.s.console = nil
 		a.s.focus = focusEditor
-		a.drawStatus()
 	}
 	switch ev.Key() {
 	case tcell.KeyEscape:
@@ -1280,7 +1259,7 @@ func (a *App) handleCommand(cmd string) {
 			file, err := os.Open(filename)
 			if err != nil {
 				log.Print(err)
-				a.drawStatus(err.Error())
+				a.status.draw([]rune(err.Error()))
 				return
 			}
 			defer file.Close()
@@ -1289,7 +1268,7 @@ func (a *App) handleCommand(cmd string) {
 			err = a.load(file)
 			if err != nil {
 				log.Print(err)
-				a.drawStatus(err.Error())
+				a.status.draw([]rune(err.Error()))
 				return
 			}
 			a.s.focus = focusEditor
@@ -1316,7 +1295,7 @@ func (a *App) handleCommand(cmd string) {
 			if filepath.Ext(filename) == ".go" {
 				bs, err := format.Source(src)
 				if err != nil {
-					a.drawStatus(err.Error())
+					a.status.draw([]rune(err.Error()))
 					return
 				}
 				src = bs
@@ -1324,14 +1303,14 @@ func (a *App) handleCommand(cmd string) {
 			err := os.WriteFile(filename, src, 0644)
 			if err != nil {
 				log.Printf("Failed to save file %s: %v", filename, err)
-				a.drawStatus("Failed to save file: " + err.Error())
+				a.status.draw([]rune("Failed to save file: " + err.Error()))
 			} else {
-				a.drawStatus("File saved as: " + filename)
+				a.status.draw([]rune("File saved as: " + filename))
 				a.s.filename = filename // update current tab
 				a.drawTabs()
 				a.s.focus = focusEditor
 				if err := a.load(bytes.NewReader(src)); err != nil {
-					a.drawStatus(err.Error())
+					a.status.draw([]rune(err.Error()))
 					return
 				}
 				a.s.row = min(a.s.row, a.s.lines.Len()-1)
@@ -1353,18 +1332,18 @@ func (a *App) handleCommand(cmd string) {
 			a.s.focus = focusEditor
 			a.goForward()
 		default:
-			a.drawStatus("unknown command: " + cmd)
+			a.status.draw([]rune("unknown command: " + cmd))
 		}
 	case ':': // go to line
 		a.s.focus = focusEditor
 		defer a.syncCursor()
 		n, err := strconv.Atoi(cmd[1:])
 		if err != nil {
-			a.drawStatus("Invalid line number")
+			a.status.draw([]rune("Invalid line number"))
 			return
 		}
 		if n > a.s.lines.Len() {
-			a.drawStatus("Line number out of range")
+			a.status.draw([]rune("Line number out of range"))
 			return
 		}
 		if n < 0 {
@@ -1446,7 +1425,6 @@ func (a *App) commandLoop() {
 }
 
 // syncCursor sync cursor position and show it.
-// when rendering line highlight, call this method after editor redraw.
 func (a *App) syncCursor() {
 	switch a.s.focus {
 	case focusEditor:
@@ -1471,6 +1449,7 @@ func (a *App) syncCursor() {
 			return
 		}
 		screen.ShowCursor(x, y)
+		a.status.draw([]rune(fmt.Sprintf("Line %d, Column %d ", a.s.row+1, screenCol+1)))
 	case focusConsole:
 		// Calculate visual width of console text up to cursor
 		consoleRunes := []rune(a.s.console)
@@ -1501,7 +1480,6 @@ var timeLastKey time.Time
 func (a *App) editorEvent(ev *tcell.EventKey) {
 	defer func() {
 		a.syncCursor()
-		a.drawStatus(fmt.Sprintf("Line %d, Column %d", a.s.row+1, a.s.col+1))
 		if ev.Key() != tcell.KeyUp && ev.Key() != tcell.KeyDown {
 			a.s.upDownCol = -1
 		}
