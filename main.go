@@ -347,18 +347,17 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		return
 	}
 
-	var lineNumber textStyle
+	var lineNum textStyle
 	if a.s.lineNumber {
-		lineNumber.text = []rune(a.s.newLineNum(row))
-		lineNumber.style = styleComment
+		lineNum.text = []rune(a.s.newLineNum(row))
+		lineNum.style = styleComment
 		if row == a.s.row {
-			lineNumber.style = styleBase.Background(tcell.ColorLightGray)
+			lineNum.style = styleBase.Background(tcell.ColorLightGray)
 		}
 	}
-
+	// Adjust for horizontal scroll
 	screenLine := expandTabs(line)
 	if a.s.left > 0 {
-		// Adjust for horizontal scroll, accounting for rune widths
 		screenCol := 0
 		for i, r := range screenLine {
 			screenCol += runewidth.RuneWidth(r)
@@ -368,13 +367,20 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			}
 		}
 		if screenCol < a.s.left {
-			screenLine = nil
-			a.editor[row-a.s.top].drawText(lineNumber)
+			a.editor[row-a.s.top].drawText(lineNum)
 			return
 		}
 	}
 
-	// selection highlight
+	// highlight syntax
+	var coloredLine []textStyle
+	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
+		coloredLine = []textStyle{{text: screenLine, style: styleBase}}
+	} else {
+		coloredLine = highlightGoLine(screenLine)
+	}
+
+	// highlight selection
 	if sel := a.s.selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
 		start, end := 0, len(screenLine)
 		if sel.startRow == row {
@@ -383,29 +389,23 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		if sel.endRow == row {
 			end = columnToVisual(line, sel.endCol) - a.s.left
 		}
-		a.editor[row-a.s.top].drawText(
-			lineNumber,
-			textStyle{text: screenLine[:start]},
-			textStyle{text: screenLine[start:end], style: styleHighlight},
-			textStyle{text: screenLine[end:]},
-		)
-		return
-	}
 
-	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
-		a.editor[row-a.s.top].drawText(
-			lineNumber,
-			textStyle{text: screenLine, style: styleBase},
-		)
-		return
+		i := 0
+		newLine := make([]textStyle, 0, len(screenLine))
+		for _, ts := range coloredLine {
+			for _, r := range ts.text {
+				if start <= i && i < end {
+					style := ts.style.Background(tcell.ColorLightSteelBlue)
+					newLine = append(newLine, textStyle{text: []rune{r}, style: style})
+				} else {
+					newLine = append(newLine, textStyle{text: []rune{r}, style: ts.style})
+				}
+				i++
+			}
+		}
+		coloredLine = newLine
 	}
-
-	// syntax highlight
-	parts := highlightGoLine(screenLine)
-	s := make([]textStyle, 0, len(parts)+1)
-	s = append(s, lineNumber)
-	s = append(s, parts...)
-	a.editor[row-a.s.top].drawText(s...)
+	a.editor[row-a.s.top].drawText(slices.Concat([]textStyle{lineNum}, coloredLine)...)
 }
 
 func (a *App) drawEditor() {
@@ -451,7 +451,7 @@ func main() {
 		log.Fatalf("%+v", err)
 	}
 	s.SetStyle(styleBase)
-	s.SetCursorStyle(tcell.CursorStyleBlinkingBlock, cursorColor)
+	s.SetCursorStyle(tcell.CursorStyleBlinkingBar, cursorColor)
 	s.EnableMouse()
 	s.EnablePaste()
 	s.Clear()
@@ -2356,9 +2356,10 @@ var (
 	styleNumber    = styleBase.Foreground(tcell.ColorBrown)
 	styleHighlight = styleBase.Foreground(tcell.ColorBlack).Background(tcell.ColorLightSteelBlue)
 
-	cursorColor = tcell.ColorDarkGray
+	cursorColor = tcell.ColorBlack
 )
 
+// highlight Go syntax
 func highlightGoLine(line []rune) []textStyle {
 	var parts []textStyle
 
