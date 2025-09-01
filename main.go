@@ -472,8 +472,8 @@ func main() {
 	go app.commandLoop()
 
 	app.s = &State{
-		tabs: []*Tab{{filename: "", lines: list.New()}},
-		// lineNumber: true,
+		tabs:       []*Tab{{filename: "", lines: list.New()}},
+		lineNumber: true,
 	}
 	app.s.Tab = app.s.tabs[0]
 	if len(os.Args) >= 2 {
