@@ -166,12 +166,12 @@ func (v *View) contains(x, y int) bool {
 
 func (a *App) resize() {
 	w, h := screen.Size()
-	a.tab = View{0, 0, w, 1, tcell.StyleDefault.Reverse(true)}
+	a.tab = View{0, 0, w, 1, styleComment}
 	a.editor = make([]*View, h-3)
 	for i := range a.editor {
 		a.editor[i] = &View{0, i + a.tab.h, w, 1, tcell.StyleDefault}
 	}
-	a.status = View{0, h - 2, w, 1, tcell.StyleDefault.Reverse(true)}
+	a.status = View{0, h - 2, w, 1, styleComment}
 	a.console = View{0, h - 1, w, 1, tcell.StyleDefault}
 }
 
@@ -283,12 +283,11 @@ func (a *App) drawTabs() {
 		} else {
 			name = filepath.Base(tab.filename)
 		}
+		style := a.tab.style
 		if i == a.s.tabIdx {
-			highlight := a.tab.style.Bold(true).Underline(true).Italic(true)
-			ts = append(ts, textStyle{text: []rune(name), style: highlight})
-		} else {
-			ts = append(ts, textStyle{text: []rune(name)})
+			style = styleBase
 		}
+		ts = append(ts, textStyle{text: []rune(name), style: style})
 		ts = append(ts, textStyle{text: []rune{' '}})
 		ts = append(ts, textStyle{text: []rune(labelClose)})
 		ts = append(ts, textStyle{text: []rune{' '}})
@@ -473,11 +472,8 @@ func main() {
 	go app.commandLoop()
 
 	app.s = &State{
-		tabs: []*Tab{{
-			filename: "",
-			lines:    list.New(),
-		}},
-		lineNumber: true,
+		tabs: []*Tab{{filename: "", lines: list.New()}},
+		// lineNumber: true,
 	}
 	app.s.Tab = app.s.tabs[0]
 	if len(os.Args) >= 2 {
