@@ -1292,9 +1292,10 @@ func (a *App) handleCommand(cmd string) {
 				bs, err := format.Source(src)
 				if err != nil {
 					a.status.draw([]rune(err.Error()))
-					return
+					log.Print(err)
+				} else {
+					src = bs
 				}
-				src = bs
 			}
 			err := os.WriteFile(filename, src, 0644)
 			if err != nil {
@@ -1708,19 +1709,14 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		a.s.row--
-		line := a.s.line(a.s.row).Value.([]rune)
-		if len(line) == 0 {
-			a.s.col = 0
-		} else if a.s.upDownCol >= 0 {
-			// moving up/down, keep previous column
-			a.s.col = min(len(line), a.s.upDownCol)
-		} else {
-			// start moving up/down, keep current column
-			a.s.upDownCol = a.s.col
-			a.s.col = min(len(line), a.s.col)
+		lineE := a.s.line(a.s.row)
+		prevLineE := lineE.Prev()
+		if a.s.upDownCol < 0 {
+			a.s.upDownCol = columnToScreenWidth(lineE.Value.([]rune), a.s.col)
 		}
-		a.jump(a.s.row, a.s.col)
+		// moving up/down, keep previous column
+		col := columnFromScreenWidth(prevLineE.Value.([]rune), a.s.upDownCol)
+		a.jump(a.s.row-1, col)
 	case tcell.KeyDown:
 		a.s.lastEdit = nil
 		a.unselect()
@@ -1734,19 +1730,14 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		a.s.row++
-		line := a.s.line(a.s.row).Value.([]rune)
-		if len(line) == 0 {
-			a.s.col = 0
-		} else if a.s.upDownCol >= 0 {
-			// moving up/down, keep previous column
-			a.s.col = min(len(line), a.s.upDownCol)
-		} else {
-			// start moving up/down, keep current column
-			a.s.upDownCol = a.s.col
-			a.s.col = min(len(line), a.s.col)
+		lineE := a.s.line(a.s.row)
+		nextE := lineE.Next()
+		if a.s.upDownCol < 0 {
+			a.s.upDownCol = columnToScreenWidth(lineE.Value.([]rune), a.s.col)
 		}
-		a.jump(a.s.row, a.s.col)
+		// moving up/down, keep previous column
+		col := columnFromScreenWidth(nextE.Value.([]rune), a.s.upDownCol)
+		a.jump(a.s.row+1, col)
 	case tcell.KeyHome, tcell.KeyCtrlA:
 		a.s.lastEdit = nil
 		a.unselect()
