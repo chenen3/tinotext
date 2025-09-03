@@ -28,7 +28,7 @@ import (
 
 type App struct {
 	s       *State
-	tab     View
+	tabbar  View
 	editor  []*View
 	status  View
 	console View
@@ -40,10 +40,9 @@ type State struct {
 	*Tab          // active tab
 	tabs          []*Tab
 	tabIdx        int    // index of active tab
-	status        string // Status message displayed in the status bar
-	console       []rune // Console input text
-	consoleCursor int    // Cursor position in the console
-	focus         int    // Current focus (editor or console)
+	command       []rune // command in the console
+	commandCursor int    // Cursor position in the console
+	focus         int    // focus on editor or console
 	lineNumber    bool   // Whether to show line numbers in the editor
 	clipboard     string
 	files         []string // top level file names
@@ -162,10 +161,10 @@ func (v *View) contains(x, y int) bool {
 
 func (a *App) resize() {
 	w, h := screen.Size()
-	a.tab = View{0, 0, w, 1, styleComment}
+	a.tabbar = View{0, 0, w, 1, styleComment}
 	a.editor = make([]*View, h-3)
 	for i := range a.editor {
-		a.editor[i] = &View{0, i + a.tab.h, w, 1, tcell.StyleDefault}
+		a.editor[i] = &View{0, i + a.tabbar.h, w, 1, tcell.StyleDefault}
 	}
 	a.status = View{0, h - 2, w, 1, styleComment}
 	a.console = View{0, h - 1, w, 1, tcell.StyleDefault}
@@ -255,7 +254,7 @@ func columnFromScreenWidth(line []rune, screenCol int) int {
 func (a *App) draw() {
 	a.drawTabs()
 	a.drawEditor()
-	a.console.draw(a.s.console)
+	a.console.draw(a.s.command)
 	a.syncCursor()
 }
 
@@ -279,7 +278,7 @@ func (a *App) drawTabs() {
 		} else {
 			name = filepath.Base(tab.filename)
 		}
-		style := a.tab.style
+		style := a.tabbar.style
 		if i == a.s.tabIdx {
 			style = styleBase
 		}
@@ -294,12 +293,12 @@ func (a *App) drawTabs() {
 	}
 
 	menuS := strings.Join(menu, " ")
-	padding := a.tab.w - totalTabWidth - len(menuS)
+	padding := a.tabbar.w - totalTabWidth - len(menuS)
 	if padding > 0 {
 		ts = append(ts, textStyle{text: []rune(strings.Repeat(" ", padding))})
 	}
 	ts = append(ts, textStyle{text: []rune(menuS)})
-	a.tab.drawText(ts...)
+	a.tabbar.drawText(ts...)
 }
 
 func (st *State) newLineNum(row int) string {
@@ -720,7 +719,7 @@ func main() {
 const scrollFactor = 0.1
 
 func (a *App) handleClick(x, y int) {
-	if a.tab.contains(x, y) {
+	if a.tabbar.contains(x, y) {
 		var totalTabWidth int
 		for _, tab := range a.s.tabs {
 			tabName := tab.filename
@@ -731,9 +730,9 @@ func (a *App) handleClick(x, y int) {
 		}
 		sep := " "
 		menuS := strings.Join(menu, sep)
-		padding := max(0, a.tab.w-totalTabWidth-len(menuS))
+		padding := max(0, a.tabbar.w-totalTabWidth-len(menuS))
 		// click menu
-		menuStart := a.tab.x + totalTabWidth + padding
+		menuStart := a.tabbar.x + totalTabWidth + padding
 		if x >= menuStart {
 			start := menuStart
 			end := 0
@@ -768,8 +767,8 @@ func (a *App) handleClick(x, y int) {
 		}
 
 		// click tabs
-		if x < a.tab.x+totalTabWidth {
-			nameStart := a.tab.x
+		if x < a.tabbar.x+totalTabWidth {
+			nameStart := a.tabbar.x
 			for i, tab := range a.s.tabs {
 				tabName := tab.filename
 				if tabName == "" {
@@ -810,7 +809,7 @@ func (a *App) handleClick(x, y int) {
 
 	if a.console.contains(x, y) {
 		a.s.focus = focusConsole
-		a.s.consoleCursor = columnFromScreenWidth([]rune(a.s.console), x-a.console.x)
+		a.s.commandCursor = columnFromScreenWidth([]rune(a.s.command), x-a.console.x)
 		a.syncCursor()
 		return
 	}
@@ -855,13 +854,13 @@ func (a *App) handleClick(x, y int) {
 
 // setConsole updates the console view with the given string.
 func (a *App) setConsole(s string, hint ...string) {
-	a.s.console = []rune(s)
-	a.s.consoleCursor = len(a.s.console)
+	a.s.command = []rune(s)
+	a.s.commandCursor = len(a.s.command)
 	if len(hint) == 0 {
-		a.console.draw(a.s.console)
+		a.console.draw(a.s.command)
 	} else {
 		a.console.drawText(
-			textStyle{text: a.s.console},
+			textStyle{text: a.s.command},
 			textStyle{text: []rune(hint[0]), style: styleComment},
 		)
 	}
@@ -931,18 +930,18 @@ func (a *App) jump(row, col int) {
 				a.drawEditorLine(prevLineNum, e.Value.([]rune))
 			}
 		}
-		prevLineNum = row
 	}
+	prevLineNum = row
 	a.syncCursor()
 }
 
 func (a *App) consoleEvent(ev *tcell.EventKey) {
 	defer func() {
-		a.console.draw(a.s.console)
+		a.console.draw(a.s.command)
 		a.syncCursor()
 	}()
 	exitConsole := func() {
-		a.s.console = nil
+		a.s.command = nil
 		a.s.focus = focusEditor
 	}
 	switch ev.Key() {
@@ -953,7 +952,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			a.drawEditorLine(a.s.row, line.Value.([]rune))
 		}
 	case tcell.KeyEnter:
-		cmd := strings.TrimSpace(string(a.s.console))
+		cmd := strings.TrimSpace(string(a.s.command))
 		if cmd == "" {
 			if len(a.s.options) > 0 && a.s.optionIdx >= 0 {
 				a.cmdCh <- ">open " + a.s.options[a.s.optionIdx]
@@ -980,31 +979,29 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			cmd = ">open " + a.s.options[a.s.optionIdx]
 		}
-		a.s.console = nil
+		a.s.command = nil
 		a.cmdCh <- cmd
 	case tcell.KeyLeft:
-		if len(a.s.console) == 0 {
-			return
+		if a.s.commandCursor > 1 {
+			a.s.commandCursor--
 		}
-		a.s.consoleCursor--
 	case tcell.KeyRight:
-		if len(a.s.console) == 0 || a.s.consoleCursor >= len(a.s.console) {
-			return
+		if a.s.commandCursor < len(a.s.command) {
+			a.s.commandCursor++
 		}
-		a.s.consoleCursor++
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if len(a.s.console) == 0 {
+		if len(a.s.command) == 0 {
 			return
 		}
-		a.s.console = slices.Delete(a.s.console, a.s.consoleCursor-1, a.s.consoleCursor)
-		a.s.consoleCursor--
-		if len(a.s.console) == 0 {
+		a.s.command = slices.Delete(a.s.command, a.s.commandCursor-1, a.s.commandCursor)
+		a.s.commandCursor--
+		if len(a.s.command) == 0 {
 			a.s.options = a.s.files
 			a.s.optionIdx = -1
-		} else if char := a.s.console[0]; char == '#' || char == ':' || char == '>' {
+		} else if char := a.s.command[0]; char == '#' || char == ':' || char == '>' {
 			return
 		} else if char == '@' {
-			keyword := string(a.s.console[1:])
+			keyword := string(a.s.command[1:])
 			if len(keyword) == 0 {
 				a.s.options = nil
 				a.status.draw(nil)
@@ -1043,7 +1040,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			if len(a.s.files) == 0 {
 				return
 			}
-			keyword := string(a.s.console)
+			keyword := string(a.s.command)
 			var filter []string
 			for _, name := range a.s.files {
 				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
@@ -1076,13 +1073,13 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		}
 		a.status.drawText(ts...)
 	case tcell.KeyRune:
-		a.s.console = slices.Insert(a.s.console, a.s.consoleCursor, ev.Rune())
-		a.s.consoleCursor++
-		switch a.s.console[0] {
+		a.s.command = slices.Insert(a.s.command, a.s.commandCursor, ev.Rune())
+		a.s.commandCursor++
+		switch a.s.command[0] {
 		case '>', '#', ':':
 			return
 		case '@':
-			keyword := string(a.s.console[1:])
+			keyword := string(a.s.command[1:])
 			if keyword == "" {
 				return
 			}
@@ -1127,7 +1124,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			if len(a.s.files) == 0 {
 				return
 			}
-			keyword := string(a.s.console)
+			keyword := string(a.s.command)
 			var filter []string
 			for _, name := range a.s.files {
 				if strings.Contains(strings.ToLower(name), strings.ToLower(keyword)) {
@@ -1176,9 +1173,9 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		a.status.drawText(ts...)
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
-		if len(a.s.console) > 0 && a.s.console[0] == '#' {
+		if len(a.s.command) > 0 && a.s.command[0] == '#' {
 			a.goBack()
-			keyword := a.s.console[1:]
+			keyword := a.s.command[1:]
 			a.s.selection = &Selection{
 				startRow: a.s.row,
 				endRow:   a.s.row,
@@ -1365,7 +1362,7 @@ func (a *App) handleCommand(cmd string) {
 		a.recordPositon(a.s.row, a.s.col)
 		a.jump(matched.Line-1, matched.Column-1)
 		a.s.focus = focusEditor
-		a.s.console = nil
+		a.s.command = nil
 		a.draw()
 	case '#': // find
 		keyword := []rune(cmd[1:])
@@ -1450,12 +1447,12 @@ func (a *App) syncCursor() {
 		a.status.draw([]rune(fmt.Sprintf("Line %d, Column %d ", a.s.row+1, screenCol+1)))
 	case focusConsole:
 		// Calculate visual width of console text up to cursor
-		consoleRunes := []rune(a.s.console)
-		if a.s.consoleCursor > len(consoleRunes) {
-			a.s.consoleCursor = len(consoleRunes)
+		consoleRunes := []rune(a.s.command)
+		if a.s.commandCursor > len(consoleRunes) {
+			a.s.commandCursor = len(consoleRunes)
 		}
 		consoleWidth := 0
-		for i := 0; i < a.s.consoleCursor && i < len(consoleRunes); i++ {
+		for i := 0; i < a.s.commandCursor && i < len(consoleRunes); i++ {
 			consoleWidth += runewidth.RuneWidth(consoleRunes[i])
 		}
 		screen.ShowCursor(a.console.x+consoleWidth, a.console.y)
@@ -1716,11 +1713,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		if a.s.row == 0 {
 			return // already at the top
-		}
-
-		if ev.Modifiers()&tcell.ModMeta != 0 {
-			a.jump(0, 0)
-			return
 		}
 
 		lineE := a.s.line(a.s.row)
