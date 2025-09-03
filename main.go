@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -23,11 +24,6 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/mattn/go-runewidth"
-)
-
-const (
-	focusEditor = iota
-	focusConsole
 )
 
 type App struct {
@@ -427,6 +423,11 @@ func (a *App) drawEditor() {
 
 var screen tcell.Screen
 
+const (
+	focusEditor = iota
+	focusConsole
+)
+
 func main() {
 	output := os.Getenv("SEYI_LOG_FILE")
 	if output == "" {
@@ -441,6 +442,35 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
+	app := &App{
+		cmdCh: make(chan string, 1),
+		done:  make(chan struct{}),
+	}
+	go app.commandLoop()
+	app.s = &State{
+		tabs:       []*Tab{{filename: "", lines: list.New()}},
+		lineNumber: true,
+	}
+	app.s.Tab = app.s.tabs[0]
+	if len(os.Args) >= 2 {
+		filename := os.Args[1]
+		app.s.filename = filename
+		f, err := os.Open(filename)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				fmt.Println(err)
+				return
+			}
+		} else {
+			err = app.load(f)
+			f.Close()
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+		}
+	}
+
 	// Initialize screen
 	s, err := tcell.NewScreen()
 	if err != nil {
@@ -449,13 +479,12 @@ func main() {
 	if err := s.Init(); err != nil {
 		log.Fatalf("%+v", err)
 	}
+	screen = s
 	s.SetStyle(styleBase)
 	s.SetCursorStyle(tcell.CursorStyleBlinkingBar, cursorColor)
 	s.EnableMouse()
 	s.EnablePaste()
 	s.Clear()
-	screen = s
-
 	quit := func() {
 		err := recover()
 		s.Fini()
@@ -464,34 +493,6 @@ func main() {
 		}
 	}
 	defer quit()
-
-	app := &App{
-		cmdCh: make(chan string, 1),
-		done:  make(chan struct{}),
-	}
-	go app.commandLoop()
-
-	app.s = &State{
-		tabs:       []*Tab{{filename: "", lines: list.New()}},
-		lineNumber: true,
-	}
-	app.s.Tab = app.s.tabs[0]
-	if len(os.Args) >= 2 {
-		filename := os.Args[1]
-		app.s.tabs[0].filename = filename
-		f, err := os.Open(filename)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		err = app.load(f)
-		f.Close()
-		if err != nil {
-			log.Print(err)
-			return
-		}
-	}
-
 	eventCh := make(chan tcell.Event, 10)
 	go s.ChannelEvents(eventCh, app.done)
 
@@ -871,7 +872,7 @@ var prevLineNum int
 // jump moves the cursor to the specified line and column,
 // If row less than 0, jump to the last line.
 // If col less than 0, jump to the end of the line.
-// To ensure the line is visible, it may scroll and redraw the editor.
+// To ensure the line is visible, it will redraw the line or the whole editor.
 func (a *App) jump(row, col int) {
 	if row < 0 || row > a.s.lines.Len()-1 {
 		row = a.s.lines.Len() - 1
@@ -1483,6 +1484,19 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		timeLastKey = time.Now()
 	}()
 	switch ev.Key() {
+	case tcell.KeyCtrlU:
+		// delete to line start
+		e := a.s.line(a.s.row)
+		if e == nil {
+			return
+		}
+		line := e.Value.([]rune)
+		if len(line) == 0 {
+			return
+		}
+		e.Value = line[a.s.col:]
+		a.s.recordEdit(Edit{row: a.s.row, col: 0, oldText: string(line[:a.s.col]), kind: editDelete})
+		a.jump(a.s.row, 0)
 	case tcell.KeyCtrlZ:
 		a.s.undo()
 		a.drawEditor()
@@ -1544,7 +1558,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			newText: string(ev.Rune()),
 			kind:    editInsert,
 		})
-		a.drawEditorLine(a.s.row, line)
+		// a.drawEditorLine(a.s.row, line)
 		a.jump(a.s.row, a.s.col+1)
 	case tcell.KeyEnter:
 		e := a.s.line(a.s.row)
@@ -1650,7 +1664,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		})
 		a.s.col--
 		a.jump(a.s.row, a.s.col)
-		a.drawEditorLine(a.s.row, line)
+		// a.drawEditorLine(a.s.row, line)
 	case tcell.KeyLeft:
 		a.s.lastEdit = nil
 		// move cursor to the start of the selection
