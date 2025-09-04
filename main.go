@@ -82,16 +82,17 @@ func (t *Tab) line(i int) *list.Element {
 		return nil
 	}
 
-	if i == 0 {
-		return t.lines.Front()
-	}
-	if i == t.lines.Len()-1 {
-		return t.lines.Back()
+	if i < t.lines.Len()/2 {
+		e := t.lines.Front()
+		for range i {
+			e = e.Next()
+		}
+		return e
 	}
 
-	e := t.lines.Front()
-	for range i {
-		e = e.Next()
+	e := t.lines.Back()
+	for j := t.lines.Len() - 1; j > i; j-- {
+		e = e.Prev()
 	}
 	return e
 }
