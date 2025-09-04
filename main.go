@@ -819,35 +819,28 @@ func (a *App) handleClick(x, y int) {
 	}
 
 	a.s.focus = focusEditor
-	if a.s.lines.Len() == 0 {
-		a.s.row = 0
-		a.s.col = 0
-	} else {
-		row := min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
+	var row, col int
+	if a.s.lines.Len() > 0 {
+		row = min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
 		line := a.s.line(row).Value.([]rune)
 		screenCol := x - a.editor[0].x - a.s.lineNumLen() + a.s.left
-		col := columnFromScreenWidth(line, screenCol)
-		a.recordPositon(a.s.row, a.s.col)
-		a.jump(row, col)
+		col = columnFromScreenWidth(line, screenCol)
 	}
 
 	if !a.s.selecting {
-		a.s.selection = &Selection{
-			startRow: a.s.row,
-			startCol: a.s.col,
-			endRow:   a.s.row,
-			endCol:   a.s.col,
-		}
+		a.s.selection = &Selection{startRow: row, startCol: col, endRow: row, endCol: col}
 		a.s.selecting = true
 	} else {
-		a.s.selection.endRow = a.s.row
-		a.s.selection.endCol = a.s.col
+		a.s.selection.endRow = row
+		a.s.selection.endCol = col
 	}
 
+	a.recordPositon(a.s.row, a.s.col)
+	a.jump(row, col)
 	a.drawEditor()     // render selection
 	a.s.upDownCol = -1 // reset up/down column tracking
 	// debug
-	if line := a.s.line(a.s.row); line != nil {
+	if line := a.s.line(row); line != nil {
 		log.Printf("clicked line: %s", string(line.Value.([]rune)))
 	}
 }
@@ -1547,15 +1540,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 
 		// No selection, insert rune normally
 		line = e.Value.([]rune)
-		line = slices.Insert(line, a.s.col, ev.Rune())
-		e.Value = line
+		e.Value = slices.Insert(line, a.s.col, ev.Rune())
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
 			col:     a.s.col,
 			newText: string(ev.Rune()),
 			kind:    editInsert,
 		})
-		// a.drawEditorLine(a.s.row, line)
 		a.jump(a.s.row, a.s.col+1)
 	case tcell.KeyEnter:
 		e := a.s.line(a.s.row)
@@ -1879,6 +1870,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				}
 			}
 			a.s.clipboard = string(copied)
+			screen.SetClipboard([]byte(string(copied)))
 			return
 		}
 
@@ -1892,6 +1884,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 		a.s.clipboard = string(line)
+		screen.SetClipboard([]byte(string(line)))
 	case tcell.KeyCtrlX:
 		if sel := a.s.selected(); sel != nil {
 			// Cut the selected text
