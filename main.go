@@ -1898,6 +1898,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				kind:    editDelete,
 			})
 			a.s.clipboard = deletedText
+			screen.SetClipboard([]byte(deletedText))
 			if sel.startRow != sel.endRow {
 				a.drawEditor() // Refresh full editor for multi-line changes
 			} else if line := a.s.line(a.s.row); line != nil {
@@ -1916,6 +1917,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(line))
+		screen.SetClipboard([]byte(deletedText))
 		a.s.clipboard = deletedText
 		a.s.recordEdit(Edit{
 			row:     a.s.row,
@@ -2341,7 +2343,7 @@ var (
 	styleString    = styleBase.Foreground(tcell.ColorDarkRed)
 	styleComment   = styleBase.Foreground(tcell.ColorGray)
 	styleNumber    = styleBase.Foreground(tcell.ColorBrown)
-	styleHighlight = styleBase.Foreground(tcell.ColorBlack).Background(tcell.ColorLightSteelBlue)
+	styleHighlight = styleBase.Background(tcell.ColorLightSteelBlue)
 
 	cursorColor = tcell.ColorBlack
 )
@@ -2415,7 +2417,8 @@ func (a *App) load(r io.Reader) error {
 	for scanner.Scan() {
 		lines.PushBack([]rune(scanner.Text()))
 	}
-	if lastLine := lines.Back().Value.([]rune); len(lastLine) != 0 {
+	back := lines.Back()
+	if back == nil || len(back.Value.([]rune)) != 0 {
 		// append newline
 		lines.PushBack([]rune{})
 	}
