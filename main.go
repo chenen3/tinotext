@@ -350,6 +350,17 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			lineNum.style = styleBase.Background(tcell.ColorLightGray)
 		}
 	}
+	if len(line) == 0 {
+		texts := []textStyle{lineNum}
+		if sel := a.s.selected(); sel != nil && sel.startRow <= row && row <= sel.endRow {
+			// make selection visible on empty line
+			style := styleBase.Background(tcell.ColorLightSteelBlue)
+			texts = append(texts, textStyle{text: []rune{' '}, style: style})
+		}
+		a.editor[row-a.s.top].drawText(texts...)
+		return
+	}
+
 	// Adjust for horizontal scroll
 	screenLine := expandTabs(line)
 	if a.s.left > 0 {
@@ -852,12 +863,12 @@ func (a *App) setConsole(s string, hint ...string) {
 	a.s.commandCursor = len(a.s.command)
 	if len(hint) == 0 {
 		a.console.draw(a.s.command)
-	} else {
-		a.console.drawText(
-			textStyle{text: a.s.command},
-			textStyle{text: []rune(hint[0]), style: styleComment},
-		)
+		return
 	}
+	a.console.drawText(
+		textStyle{text: a.s.command},
+		textStyle{text: []rune(hint[0]), style: styleComment},
+	)
 }
 
 var prevLineNum int
