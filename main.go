@@ -380,10 +380,10 @@ func (a *App) drawEditorLine(row int, line []rune) {
 
 	// highlight syntax
 	var coloredLine []textStyle
-	if a.s.filename == "" || !strings.HasSuffix(a.s.filename, ".go") {
-		coloredLine = []textStyle{{text: screenLine, style: styleBase}}
-	} else {
+	if filepath.Ext(a.s.filename) == ".go" {
 		coloredLine = highlightGoLine(screenLine)
+	} else {
+		coloredLine = []textStyle{{text: screenLine, style: styleBase}}
 	}
 
 	// highlight selection

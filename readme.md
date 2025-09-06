@@ -5,7 +5,7 @@ A mini text editor around 2k lines of code.
 Usage:
 ```
 go build -o seyi .
-./seyi <filename>
+./seyi [file]
 ```
 
 Key bindings:
@@ -29,3 +29,11 @@ ctrl-u delete back to line start
 ctrl-p command
 shift-tab decrease indent
 ```
+
+Console commands:
+- `#<text>` find text
+- `@<symbol>` go to symbol
+- `:<line>` go to line
+- `>open <file>`
+- `>save <file>`
+- `>linenumber` toggle line number
