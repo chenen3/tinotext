@@ -105,6 +105,7 @@ func (st *State) switchTab(i int) {
 
 	st.tabIdx = i
 	st.Tab = st.tabs[i]
+	st.focus = focusEditor
 }
 
 type View struct {
@@ -135,7 +136,7 @@ type textStyle struct {
 
 // drawText draw inline texts with multiple styles.
 // Note that it does not handle tab expansion.
-func (v *View) drawText(texts ...textStyle) {
+func (v *View) drawText(texts []textStyle) {
 	col := 0
 	for _, ts := range texts {
 		style := ts.style
@@ -299,7 +300,7 @@ func (a *App) drawTabs() {
 		ts = append(ts, textStyle{text: []rune(strings.Repeat(" ", padding))})
 	}
 	ts = append(ts, textStyle{text: []rune(menuS)})
-	a.tabbar.drawText(ts...)
+	a.tabbar.drawText(ts)
 }
 
 func (st *State) newLineNum(row int) string {
@@ -357,7 +358,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			style := styleBase.Background(tcell.ColorLightSteelBlue)
 			texts = append(texts, textStyle{text: []rune{' '}, style: style})
 		}
-		a.editor[row-a.s.top].drawText(texts...)
+		a.editor[row-a.s.top].drawText(texts)
 		return
 	}
 
@@ -373,7 +374,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			}
 		}
 		if screenCol < a.s.left {
-			a.editor[row-a.s.top].drawText(lineNum)
+			a.editor[row-a.s.top].drawText([]textStyle{lineNum})
 			return
 		}
 	}
@@ -411,10 +412,18 @@ func (a *App) drawEditorLine(row int, line []rune) {
 		}
 		coloredLine = newLine
 	}
-	a.editor[row-a.s.top].drawText(slices.Concat([]textStyle{lineNum}, coloredLine)...)
+	a.editor[row-a.s.top].drawText(slices.Concat([]textStyle{lineNum}, coloredLine))
 }
 
 func (a *App) drawEditor() {
+	if a.s.lines.Len() == 0 {
+		// clear the editor area
+		for _, lineView := range a.editor {
+			lineView.draw(nil)
+		}
+		return
+	}
+
 	e := a.s.lines.Front()
 	for range a.s.top {
 		e = e.Next()
@@ -456,13 +465,13 @@ func main() {
 	app := &App{
 		cmdCh: make(chan string, 1),
 		done:  make(chan struct{}),
-	}
-	go app.commandLoop()
-	app.s = &State{
-		tabs:       []*Tab{{filename: "", lines: list.New()}},
-		lineNumber: true,
+		s: &State{
+			lineNumber: true,
+			tabs:       []*Tab{{filename: "", lines: list.New()}},
+		},
 	}
 	app.s.Tab = app.s.tabs[0]
+	go app.commandLoop()
 	if len(os.Args) >= 2 {
 		filename := os.Args[1]
 		app.s.filename = filename
@@ -592,7 +601,7 @@ func main() {
 					for _, option := range app.s.options {
 						ts = append(ts, textStyle{text: []rune(option + " ")})
 					}
-					app.status.drawText(ts...)
+					app.status.drawText(ts)
 
 					app.s.focus = focusConsole
 					app.setConsole("", "file name")
@@ -669,17 +678,16 @@ func main() {
 						lines:    list.New(),
 					})
 					app.s.switchTab(len(app.s.tabs) - 1)
-					app.s.focus = focusEditor
 					app.draw()
 					continue
 				}
 
-				if app.s.focus == focusConsole {
+				switch app.s.focus {
+				case focusEditor:
+					app.editorEvent(ev)
+				case focusConsole:
 					app.consoleEvent(ev)
-					app.syncCursor()
-					continue
 				}
-				app.editorEvent(ev)
 			case *tcell.EventMouse:
 				x, y := ev.Position()
 				switch ev.Buttons() {
@@ -797,7 +805,6 @@ func (a *App) handleClick(x, y int) {
 					// switch tab
 					if i != a.s.tabIdx {
 						a.s.switchTab(i)
-						a.s.focus = focusEditor
 						a.draw()
 					}
 					return
@@ -830,8 +837,9 @@ func (a *App) handleClick(x, y int) {
 		return
 	}
 
+	// click editor area
 	a.s.focus = focusEditor
-	var row, col int
+	row, col := 0, 0
 	if a.s.lines.Len() > 0 {
 		row = min(y-a.editor[0].y+a.s.top, a.s.lines.Len()-1)
 		line := a.s.line(row).Value.([]rune)
@@ -865,10 +873,10 @@ func (a *App) setConsole(s string, hint ...string) {
 		a.console.draw(a.s.command)
 		return
 	}
-	a.console.drawText(
-		textStyle{text: a.s.command},
-		textStyle{text: []rune(hint[0]), style: styleComment},
-	)
+	a.console.drawText([]textStyle{
+		{text: a.s.command},
+		{text: []rune(hint[0]), style: styleComment},
+	})
 }
 
 var prevLineNum int
@@ -1076,7 +1084,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 				ts = append(ts, textStyle{text: []rune(option + " ")})
 			}
 		}
-		a.status.drawText(ts...)
+		a.status.drawText(ts)
 	case tcell.KeyRune:
 		a.s.command = slices.Insert(a.s.command, a.s.commandCursor, ev.Rune())
 		a.s.commandCursor++
@@ -1124,7 +1132,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
-			a.status.drawText(ts...)
+			a.status.drawText(ts)
 		default: // search file
 			if len(a.s.files) == 0 {
 				return
@@ -1159,7 +1167,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
-			a.status.drawText(ts...)
+			a.status.drawText(ts)
 		}
 	case tcell.KeyTAB, tcell.KeyBacktab:
 		if len(a.s.options) <= 0 {
@@ -1175,7 +1183,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			ts = append(ts, textStyle{text: []rune(option + " ")})
 		}
 		ts[a.s.optionIdx].style = styleHighlight
-		a.status.drawText(ts...)
+		a.status.drawText(ts)
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
 		if len(a.s.command) > 0 && a.s.command[0] == '#' {
@@ -1222,11 +1230,6 @@ func (st *State) closeTab(index int) {
 }
 
 // handleCommand processes a command string and performs actions based on its prefix.
-// Commands:
-// - :<line_number> go to line
-// - @<symbol> go to symbol
-// - #<text> find text
-// - ><command>
 func (a *App) handleCommand(cmd string) {
 	// this function is called outside the main goroutine,
 	// so ensure to call screen.Show() after making changes to reflect updates.
@@ -1250,7 +1253,6 @@ func (a *App) handleCommand(cmd string) {
 			}
 			if i >= 0 {
 				a.s.switchTab(i)
-				a.s.focus = focusEditor
 				a.draw()
 				return
 			}
@@ -1270,7 +1272,6 @@ func (a *App) handleCommand(cmd string) {
 				a.status.draw([]rune(err.Error()))
 				return
 			}
-			a.s.focus = focusEditor
 			a.draw()
 			return
 		case "save":
@@ -1509,7 +1510,6 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		var line []rune
 		e := a.s.line(a.s.row)
 		if e == nil {
-			// No line exists, create a new one
 			line = []rune{ev.Rune()}
 			a.s.lines.PushBack(line)
 			a.s.recordEdit(Edit{
@@ -1518,8 +1518,9 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				newText: string(ev.Rune()),
 				kind:    editInsert,
 			})
-			a.s.col++
-			a.drawEditorLine(a.s.row, line)
+			// a.s.col++
+			a.jump(a.s.row, a.s.col+1)
+			// a.drawEditorLine(a.s.row, line)
 			return
 		}
 
@@ -1944,7 +1945,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if sel := a.s.selected(); sel != nil {
 			deleted := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
-			a.s.insertAt(a.s.clipboard, sel.startRow, sel.startCol)
+			a.s.insertText(a.s.clipboard, sel.startRow, sel.startCol)
 			a.s.recordEdit(Edit{
 				row:     sel.startRow,
 				col:     sel.endCol,
@@ -1954,7 +1955,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			})
 		} else {
 			row, col := a.s.row, a.s.col
-			a.s.insertAt(a.s.clipboard, row, col)
+			a.s.insertText(a.s.clipboard, row, col)
 			a.s.recordEdit(Edit{
 				row:     row,
 				col:     col,
@@ -1997,10 +1998,10 @@ func (a *App) goForward() {
 	a.s.forwardStack = a.s.forwardStack[:len(a.s.forwardStack)-2]
 }
 
-// insertAt inserts a string at a specific position in the editor.
+// insertText inserts the text at the specific position in the editor.
 // If s contains multiple lines, it will be split and inserted accordingly.
 // It updates the cursor position to the end of the inserted text.
-func (st *State) insertAt(s string, row, col int) {
+func (st *State) insertText(s string, row, col int) {
 	if s == "" {
 		return
 	}
@@ -2189,7 +2190,7 @@ func (st *State) redo() {
 func (st *State) applyEdit(e Edit) {
 	switch e.kind {
 	case editInsert:
-		st.insertAt(e.newText, e.row, e.col)
+		st.insertText(e.newText, e.row, e.col)
 	case editDelete:
 		lines := strings.Split(e.oldText, "\n")
 		if len(lines) == 1 {
@@ -2204,7 +2205,7 @@ func (st *State) applyEdit(e Edit) {
 		} else {
 			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len(lines[len(lines)-1]))
 		}
-		st.insertAt(e.newText, e.row, e.col)
+		st.insertText(e.newText, e.row, e.col)
 	}
 }
 

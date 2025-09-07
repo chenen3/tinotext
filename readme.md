@@ -37,3 +37,5 @@ Console commands:
 - `>open <file>`
 - `>save <file>`
 - `>linenumber` toggle line number
+- `>back` go back
+- `>forward` go forward
