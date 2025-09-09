@@ -51,15 +51,16 @@ type State struct {
 }
 
 type Tab struct {
-	filename  string
-	lines     *list.List          // element is rune slice
-	row       int                 // Current row position (starts from 0)
-	col       int                 // Current column position (starts from 0)
-	top       int                 // vertical scroll  (starts from 0)
-	left      int                 // horizontal scroll  (starts from 0)
-	upDownCol int                 // Column to maintain while navigating up/down
-	symbols   map[string][]Symbol // symbol name to list of symbols
-	// completion   string
+	filename     string
+	lines        *list.List          // element is rune slice
+	row          int                 // Current row position (starts from 0)
+	col          int                 // Current column position (starts from 0)
+	top          int                 // vertical scroll  (starts from 0)
+	left         int                 // horizontal scroll  (starts from 0)
+	upDownCol    int                 // Column to maintain while navigating up/down
+	symbols      map[string][]Symbol // symbol name to list of symbols
+	hint         string
+	hintOff      int
 	selecting    bool
 	selection    *Selection
 	undoStack    []Edit
@@ -134,9 +135,8 @@ type textStyle struct {
 	style tcell.Style
 }
 
-// drawText draw inline texts with multiple styles.
-// Note that it does not handle tab expansion.
-func (v *View) drawText(texts []textStyle) {
+// drawTexts draw inline texts with different styles.
+func (v *View) drawTexts(texts []textStyle) {
 	col := 0
 	for _, ts := range texts {
 		style := ts.style
@@ -300,7 +300,7 @@ func (a *App) drawTabs() {
 		ts = append(ts, textStyle{text: []rune(strings.Repeat(" ", padding))})
 	}
 	ts = append(ts, textStyle{text: []rune(menuS)})
-	a.tabbar.drawText(ts)
+	a.tabbar.drawTexts(ts)
 }
 
 func (st *State) newLineNum(row int) string {
@@ -358,7 +358,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			style := styleBase.Background(tcell.ColorLightSteelBlue)
 			texts = append(texts, textStyle{text: []rune{' '}, style: style})
 		}
-		a.editor[row-a.s.top].drawText(texts)
+		a.editor[row-a.s.top].drawTexts(texts)
 		return
 	}
 
@@ -374,7 +374,7 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			}
 		}
 		if screenCol < a.s.left {
-			a.editor[row-a.s.top].drawText([]textStyle{lineNum})
+			a.editor[row-a.s.top].drawTexts([]textStyle{lineNum})
 			return
 		}
 	}
@@ -411,8 +411,11 @@ func (a *App) drawEditorLine(row int, line []rune) {
 			}
 		}
 		coloredLine = newLine
+	} else if a.s.hint != "" && row == a.s.row {
+		hint := a.s.hint[a.s.hintOff:]
+		coloredLine = append(coloredLine, textStyle{text: []rune(hint), style: styleComment})
 	}
-	a.editor[row-a.s.top].drawText(slices.Concat([]textStyle{lineNum}, coloredLine))
+	a.editor[row-a.s.top].drawTexts(slices.Concat([]textStyle{lineNum}, coloredLine))
 }
 
 func (a *App) drawEditor() {
@@ -482,7 +485,7 @@ func main() {
 				return
 			}
 		} else {
-			err = app.load(f)
+			err = app.s.loadSource(f)
 			f.Close()
 			if err != nil {
 				fmt.Println(err)
@@ -601,7 +604,7 @@ func main() {
 					for _, option := range app.s.options {
 						ts = append(ts, textStyle{text: []rune(option + " ")})
 					}
-					app.status.drawText(ts)
+					app.status.drawTexts(ts)
 
 					app.s.focus = focusConsole
 					app.setConsole("", "file name")
@@ -618,27 +621,6 @@ func main() {
 					app.s.focus = focusConsole
 					app.setConsole("@", "symbol")
 					app.syncCursor()
-
-					if len(app.s.tabs) == 0 {
-						continue
-					}
-					if !strings.HasSuffix(app.s.filename, ".go") {
-						// Go symbols only
-						continue
-					}
-					var src strings.Builder
-					for e := app.s.lines.Front(); e != nil; e = e.Next() {
-						src.WriteString(string(e.Value.([]rune)))
-						if e != app.s.lines.Back() {
-							src.WriteString("\n")
-						}
-					}
-					symbols, err := ParseSymbol(app.s.filename, src.String())
-					if err != nil {
-						app.status.draw([]rune("Failed to parse symbols: " + err.Error()))
-						continue
-					}
-					app.s.symbols = symbols
 					app.s.options = nil
 					app.s.optionIdx = -1
 					continue
@@ -873,7 +855,7 @@ func (a *App) setConsole(s string, hint ...string) {
 		a.console.draw(a.s.command)
 		return
 	}
-	a.console.drawText([]textStyle{
+	a.console.drawTexts([]textStyle{
 		{text: a.s.command},
 		{text: []rune(hint[0]), style: styleComment},
 	})
@@ -1040,7 +1022,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			slices.Sort(filter)
 			j := 0
 			for i := range filter {
-				if strings.Index(strings.ToLower(filter[i]), strings.ToLower(keyword)) == 0 {
+				if strings.HasPrefix(strings.ToLower(filter[i]), strings.ToLower(keyword)) {
 					// move the relevant forward
 					filter[i], filter[j] = filter[j], filter[i]
 					j++
@@ -1084,7 +1066,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 				ts = append(ts, textStyle{text: []rune(option + " ")})
 			}
 		}
-		a.status.drawText(ts)
+		a.status.drawTexts(ts)
 	case tcell.KeyRune:
 		a.s.command = slices.Insert(a.s.command, a.s.commandCursor, ev.Rune())
 		a.s.commandCursor++
@@ -1132,7 +1114,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
-			a.status.drawText(ts)
+			a.status.drawTexts(ts)
 		default: // search file
 			if len(a.s.files) == 0 {
 				return
@@ -1167,7 +1149,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 					ts = append(ts, textStyle{text: []rune(option + " ")})
 				}
 			}
-			a.status.drawText(ts)
+			a.status.drawTexts(ts)
 		}
 	case tcell.KeyTAB, tcell.KeyBacktab:
 		if len(a.s.options) <= 0 {
@@ -1183,7 +1165,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			ts = append(ts, textStyle{text: []rune(option + " ")})
 		}
 		ts[a.s.optionIdx].style = styleHighlight
-		a.status.drawText(ts)
+		a.status.drawTexts(ts)
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
 		if len(a.s.command) > 0 && a.s.command[0] == '#' {
@@ -1266,7 +1248,7 @@ func (a *App) handleCommand(cmd string) {
 			defer file.Close()
 			a.s.tabs = append(a.s.tabs, &Tab{filename: filename})
 			a.s.switchTab(len(a.s.tabs) - 1)
-			err = a.load(file)
+			err = a.s.loadSource(file)
 			if err != nil {
 				log.Print(err)
 				a.status.draw([]rune(err.Error()))
@@ -1310,7 +1292,7 @@ func (a *App) handleCommand(cmd string) {
 				a.s.filename = filename // update current tab
 				a.drawTabs()
 				a.s.focus = focusEditor
-				if err := a.load(bytes.NewReader(src)); err != nil {
+				if err := a.s.loadSource(bytes.NewReader(src)); err != nil {
 					a.status.draw([]rune(err.Error()))
 					return
 				}
@@ -1507,6 +1489,10 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.redo()
 		a.drawEditor()
 	case tcell.KeyRune:
+		defer func() {
+			a.s.setHint()
+			a.drawEditorLine(a.s.row, a.s.line(a.s.row).Value.([]rune))
+		}()
 		var line []rune
 		e := a.s.line(a.s.row)
 		if e == nil {
@@ -1518,9 +1504,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				newText: string(ev.Rune()),
 				kind:    editInsert,
 			})
-			// a.s.col++
 			a.jump(a.s.row, a.s.col+1)
-			// a.drawEditorLine(a.s.row, line)
 			return
 		}
 
@@ -1613,6 +1597,10 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.drawEditor()
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		defer func() {
+			a.s.setHint()
+			a.drawEditorLine(a.s.row, a.s.line(a.s.row).Value.([]rune))
+		}()
 		// delete selection
 		if sel := a.s.selected(); sel != nil {
 			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
@@ -1791,15 +1779,29 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 
-		a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: "\t", kind: editInsert})
-		char := '\t'
 		e := a.s.line(a.s.row)
 		if e == nil {
-			e = a.s.lines.PushBack([]rune{char})
+			e = a.s.lines.PushBack([]rune{'\t'})
+			a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
+			a.s.col++
 		} else {
 			line := e.Value.([]rune)
-			line = slices.Insert(line, a.s.col, char)
-			a.s.col++
+			if a.s.hint != "" {
+				line = slices.Concat(line[:a.s.col-a.s.hintOff], []rune(a.s.hint), line[a.s.col:])
+				a.s.recordEdit(Edit{
+					row:     a.s.row,
+					col:     a.s.col - a.s.hintOff,
+					oldText: string(line[a.s.col-a.s.hintOff : a.s.col]),
+					newText: a.s.hint,
+					kind:    editReplace,
+				})
+				a.s.col += len([]rune(a.s.hint)) - a.s.hintOff
+				a.s.hint = ""
+			} else {
+				line = slices.Insert(line, a.s.col, '\t')
+				a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
+				a.s.col++
+			}
 			e.Value = line
 		}
 		a.drawEditorLine(a.s.row, e.Value.([]rune))
@@ -1945,17 +1947,17 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if sel := a.s.selected(); sel != nil {
 			deleted := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
-			a.s.insertText(a.s.clipboard, sel.startRow, sel.startCol)
+			a.s.insertText([]rune(a.s.clipboard), sel.startRow, sel.startCol)
 			a.s.recordEdit(Edit{
 				row:     sel.startRow,
-				col:     sel.endCol,
+				col:     sel.startCol,
 				oldText: deleted,
 				newText: a.s.clipboard,
 				kind:    editReplace,
 			})
 		} else {
 			row, col := a.s.row, a.s.col
-			a.s.insertText(a.s.clipboard, row, col)
+			a.s.insertText([]rune(a.s.clipboard), row, col)
 			a.s.recordEdit(Edit{
 				row:     row,
 				col:     col,
@@ -1968,6 +1970,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.goBack()
 	case tcell.KeyEscape:
 		a.s.selection = nil
+		a.s.hint = ""
 		a.drawEditor()
 	}
 }
@@ -2001,8 +2004,8 @@ func (a *App) goForward() {
 // insertText inserts the text at the specific position in the editor.
 // If s contains multiple lines, it will be split and inserted accordingly.
 // It updates the cursor position to the end of the inserted text.
-func (st *State) insertText(s string, row, col int) {
-	if s == "" {
+func (st *State) insertText(runes []rune, row, col int) {
+	if len(runes) == 0 {
 		return
 	}
 
@@ -2010,35 +2013,24 @@ func (st *State) insertText(s string, row, col int) {
 	if e == nil {
 		e = st.lines.PushBack([]rune{})
 	}
-
-	lines := strings.Split(s, "\n")
-	// Single line
-	if len(lines) == 1 {
-		chars := []rune(lines[0])
-		line := slices.Insert(e.Value.([]rune), col, chars...)
-		e.Value = line
-		st.row = row
-		st.col = col + len(chars)
-		return
-	}
-
-	// multiple lines
-	origin := e.Value.([]rune)
-	for i, line := range lines {
-		chars := []rune(line)
-		if i == 0 {
-			// First line
-			e.Value = append(origin[:col], chars...)
-		} else if i == len(lines)-1 {
-			// Last line
-			st.lines.InsertAfter(append(chars, origin[col:]...), e)
+	line := e.Value.([]rune)
+	for _, r := range runes {
+		if r == '\n' {
+			// break the line
+			e.Value = line[:col]
+			newLine := line[col:]
+			e = st.lines.InsertAfter(newLine, e)
+			row++
+			col = 0
+			line = newLine
 		} else {
-			// Middle lines
-			e = st.lines.InsertAfter(chars, e)
+			line = slices.Insert(line, col, r)
+			col++
 		}
 	}
-	st.row += len(lines) - 1
-	st.col = len([]rune(lines[len(lines)-1]))
+	e.Value = line
+	st.row = row
+	st.col = col
 }
 
 // unselect cancel the selection and redraws the affected lines.
@@ -2190,22 +2182,22 @@ func (st *State) redo() {
 func (st *State) applyEdit(e Edit) {
 	switch e.kind {
 	case editInsert:
-		st.insertText(e.newText, e.row, e.col)
+		st.insertText([]rune(e.newText), e.row, e.col)
 	case editDelete:
 		lines := strings.Split(e.oldText, "\n")
 		if len(lines) == 1 {
-			st.deleteRange(e.row, e.col, e.row, e.col+len(e.oldText))
+			st.deleteRange(e.row, e.col, e.row, e.col+len([]rune(e.oldText)))
 		} else {
-			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len(lines[len(lines)-1]))
+			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
 		}
 	case editReplace:
 		lines := strings.Split(e.oldText, "\n")
 		if len(lines) == 1 {
-			st.deleteRange(e.row, e.col, e.row, e.col+len(e.oldText))
+			st.deleteRange(e.row, e.col, e.row, e.col+len([]rune(e.oldText)))
 		} else {
-			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len(lines[len(lines)-1]))
+			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
 		}
-		st.insertText(e.newText, e.row, e.col)
+		st.insertText([]rune(e.newText), e.row, e.col)
 	}
 }
 
@@ -2214,7 +2206,6 @@ func (st *State) applyEdit(e Edit) {
 // to create more intuitive undo/redo behavior.
 func (st *State) recordEdit(e Edit) {
 	now := time.Now()
-
 	if st.lastEdit != nil && e.kind == st.lastEdit.kind &&
 		e.kind != editReplace && // Skip coalescing for replaces
 		e.row == st.lastEdit.row && now.Sub(st.lastEdit.time) < time.Second {
@@ -2258,7 +2249,10 @@ type Symbol struct {
 	Receiver string     // for method: struct name, for field: struct name
 }
 
-func ParseSymbol(filename string, src string) (map[string][]Symbol, error) {
+// ParseSymbol parses Go source code and extracts symbols such as functions,
+// types, variables, constants, and struct fields.
+// If src != nil, it must be string, []byte, or io.Reader.
+func ParseSymbol(filename string, src any) (map[string][]Symbol, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, src, 0)
 	if err != nil {
@@ -2422,12 +2416,16 @@ func highlightGoLine(line []rune) []textStyle {
 	return parts
 }
 
-// load reads lines from r and adds them to current tab's buffer
-func (a *App) load(r io.Reader) error {
+// loadSource reads lines from r and puts them to current tab's buffer.
+// If the file is a Go source file, it also parses and indexes its symbols.
+func (st *State) loadSource(r io.Reader) error {
 	var lines list.List
+	var buf bytes.Buffer
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		lines.PushBack([]rune(scanner.Text()))
+		buf.Write(scanner.Bytes())
+		buf.WriteByte('\n')
 	}
 	back := lines.Back()
 	if back == nil || len(back.Value.([]rune)) != 0 {
@@ -2438,6 +2436,51 @@ func (a *App) load(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	a.s.lines = &lines
+	st.lines = &lines
+
+	if !strings.HasSuffix(st.filename, ".go") {
+		return nil
+	}
+	symbols, err := ParseSymbol(st.filename, buf.Bytes())
+	if err != nil {
+		log.Printf("parse symbol: %s", err.Error())
+		return nil
+	}
+	st.symbols = symbols
 	return nil
+}
+
+func (st *State) setHint() {
+	if len(st.symbols) == 0 {
+		return
+	}
+	e := st.line(st.row)
+	if e == nil {
+		return
+	}
+	line := e.Value.([]rune)
+	if st.col != len(line) {
+		// only show hint when cursor is at the end of the line
+		st.hint = ""
+		return
+	}
+
+	i := st.col - 1
+	for i >= 0 && (unicode.IsLetter(line[i]) || unicode.IsDigit(line[i]) || line[i] == '_') {
+		i--
+	}
+	word := string(line[i+1 : st.col])
+	if len(word) < 2 {
+		st.hint = ""
+		return
+	}
+
+	for k := range st.symbols {
+		if strings.HasPrefix(strings.ToLower(k), strings.ToLower(word)) {
+			st.hint = k
+			st.hintOff = len(word)
+			return
+		}
+	}
+	st.hint = ""
 }
