@@ -722,6 +722,9 @@ const scrollFactor = 0.1
 
 func (a *App) handleClick(x, y int) {
 	if a.tabbar.contains(x, y) {
+		if a.s.selecting {
+			return
+		}
 		var totalTabWidth int
 		for _, tab := range a.s.tabs {
 			tabName := tab.filename
@@ -848,16 +851,16 @@ func (a *App) handleClick(x, y int) {
 }
 
 // setConsole updates the console view with the given string.
-func (a *App) setConsole(s string, hint ...string) {
+func (a *App) setConsole(s string, placeholder ...string) {
 	a.s.command = []rune(s)
 	a.s.commandCursor = len(a.s.command)
-	if len(hint) == 0 {
+	if len(placeholder) == 0 {
 		a.console.draw(a.s.command)
 		return
 	}
 	a.console.drawTexts([]textStyle{
 		{text: a.s.command},
-		{text: []rune(hint[0]), style: styleComment},
+		{text: []rune(placeholder[0]), style: styleComment},
 	})
 }
 
