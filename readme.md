@@ -25,6 +25,7 @@ ctrl-g go to line
 ctrl-r go to symbol
 ctrl-a go to line start
 ctrl-e go to line end
+ctrl-b go to symbol under the cursor
 ctrl-u delete back to line start
 ctrl-p command
 shift-tab decrease indent

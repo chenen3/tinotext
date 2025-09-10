@@ -68,6 +68,7 @@ type Tab struct {
 	lastEdit     *Edit
 	backStack    []int
 	forwardStack []int
+	prevLineNum  int
 }
 
 type Selection struct {
@@ -864,8 +865,6 @@ func (a *App) setConsole(s string, placeholder ...string) {
 	})
 }
 
-var prevLineNum int
-
 // jump moves the cursor to the specified line and column,
 // If row less than 0, jump to the last line.
 // If col less than 0, jump to the end of the line.
@@ -918,18 +917,19 @@ func (a *App) jump(row, col int) {
 		scroll = true
 	}
 
+	a.s.hint = ""
 	if scroll {
 		a.drawEditor()
 	} else {
 		// highlight current line number, cancel previous
 		a.drawEditorLine(row, line)
-		if row != prevLineNum && (a.s.top <= prevLineNum && prevLineNum < a.s.top+len(a.editor)) {
-			if e := a.s.line(prevLineNum); e != nil {
-				a.drawEditorLine(prevLineNum, e.Value.([]rune))
+		if row != a.s.prevLineNum && (a.s.top <= a.s.prevLineNum && a.s.prevLineNum < a.s.top+len(a.editor)) {
+			if e := a.s.line(a.s.prevLineNum); e != nil {
+				a.drawEditorLine(a.s.prevLineNum, e.Value.([]rune))
 			}
 		}
 	}
-	prevLineNum = row
+	a.s.prevLineNum = row
 	a.syncCursor()
 }
 
@@ -1061,15 +1061,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			a.s.options = filter
 			a.s.optionIdx = 0
 		}
-		ts := make([]textStyle, 0, len(a.s.options))
-		for i, option := range a.s.options {
-			if i == a.s.optionIdx {
-				ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
-			} else {
-				ts = append(ts, textStyle{text: []rune(option + " ")})
-			}
-		}
-		a.status.drawTexts(ts)
+		a.showOptions()
 	case tcell.KeyRune:
 		a.s.command = slices.Insert(a.s.command, a.s.commandCursor, ev.Rune())
 		a.s.commandCursor++
@@ -1109,15 +1101,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			a.s.options = filter
 			a.s.optionIdx = 0
-			ts := make([]textStyle, 0, len(a.s.options))
-			for i, option := range a.s.options {
-				if i == a.s.optionIdx {
-					ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
-				} else {
-					ts = append(ts, textStyle{text: []rune(option + " ")})
-				}
-			}
-			a.status.drawTexts(ts)
+			a.showOptions()
 		default: // search file
 			if len(a.s.files) == 0 {
 				return
@@ -1144,15 +1128,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 			}
 			a.s.options = filter
 			a.s.optionIdx = 0
-			ts := make([]textStyle, 0, len(a.s.options))
-			for i, option := range a.s.options {
-				if i == a.s.optionIdx {
-					ts = append(ts, textStyle{text: []rune(option + " "), style: styleHighlight})
-				} else {
-					ts = append(ts, textStyle{text: []rune(option + " ")})
-				}
-			}
-			a.status.drawTexts(ts)
+			a.showOptions()
 		}
 	case tcell.KeyTAB, tcell.KeyBacktab:
 		if len(a.s.options) <= 0 {
@@ -1163,12 +1139,7 @@ func (a *App) consoleEvent(ev *tcell.EventKey) {
 		} else {
 			a.s.optionIdx = (a.s.optionIdx - 1 + len(a.s.options)) % len(a.s.options)
 		}
-		ts := make([]textStyle, 0, len(a.s.options))
-		for _, option := range a.s.options {
-			ts = append(ts, textStyle{text: []rune(option + " ")})
-		}
-		ts[a.s.optionIdx].style = styleHighlight
-		a.status.drawTexts(ts)
+		a.showOptions()
 	case tcell.KeyCtrlUnderscore:
 		// go to previous found keyword
 		if len(a.s.command) > 0 && a.s.command[0] == '#' {
@@ -1975,6 +1946,49 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.s.selection = nil
 		a.s.hint = ""
 		a.drawEditor()
+	case tcell.KeyCtrlB: // go to symbol under cursor
+		e := a.s.line(a.s.row)
+		if e == nil {
+			return
+		}
+		line := e.Value.([]rune)
+		start := a.s.col - 1
+		for start >= 0 && (unicode.IsLetter(line[start]) || unicode.IsDigit(line[start]) || line[start] == '_') {
+			start--
+		}
+		stop := a.s.col
+		for stop < len(line) && (unicode.IsLetter(line[stop]) || unicode.IsDigit(line[stop]) || line[stop] == '_') {
+			stop++
+		}
+		word := string(line[start+1 : stop])
+		if len(word) == 0 {
+			return
+		}
+		symbols, ok := a.s.symbols[word]
+		if !ok {
+			return
+		}
+
+		if len(symbols) == 1 {
+			a.recordPositon(a.s.row, a.s.col)
+			a.jump(symbols[0].Line-1, symbols[0].Column-1)
+			return
+		}
+		// multiple symbols found, show options
+		var options []string
+		for _, sym := range symbols {
+			if sym.Receiver != "" {
+				options = append(options, sym.Receiver+"."+sym.Name)
+			} else {
+				options = append(options, sym.Name)
+			}
+		}
+		slices.Sort(options)
+		a.setConsole("@" + word)
+		a.s.focus = focusConsole
+		a.s.options = options
+		a.s.optionIdx = 0
+		a.showOptions()
 	}
 }
 
@@ -2362,7 +2376,6 @@ func highlightGoLine(line []rune) []textStyle {
 	var parts []textStyle
 
 	var inString bool
-	var inComment bool
 	var word strings.Builder
 	flushWord := func() {
 		if word.Len() > 0 {
@@ -2387,7 +2400,7 @@ func highlightGoLine(line []rune) []textStyle {
 		}
 
 		// Strings
-		if c == '"' && !inComment {
+		if c == '"' {
 			if inString {
 				word.WriteRune(c)
 				parts = append(parts, textStyle{text: []rune(word.String()), style: styleString})
@@ -2486,4 +2499,17 @@ func (st *State) setHint() {
 		}
 	}
 	st.hint = ""
+}
+
+// showOptions draw options in the status line
+func (a *App) showOptions() {
+	ts := make([]textStyle, 0, len(a.s.options))
+	for i, opt := range a.s.options {
+		if i == a.s.optionIdx {
+			ts = append(ts, textStyle{text: []rune(opt + " "), style: styleHighlight})
+		} else {
+			ts = append(ts, textStyle{text: []rune(opt + " ")})
+		}
+	}
+	a.status.drawTexts(ts)
 }
