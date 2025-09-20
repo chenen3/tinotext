@@ -63,9 +63,9 @@ type Tab struct {
 	hintOff      int
 	selecting    bool
 	selection    *Selection
-	undoStack    []Edit
-	redoStack    []Edit
-	lastEdit     *Edit
+	changes      []Change
+	changeIndex  int
+	lastChange   *Change
 	backStack    []int
 	forwardStack []int
 	prevLineNum  int
@@ -1454,7 +1454,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			return
 		}
 		e.Value = line[a.s.col:]
-		a.s.recordEdit(Edit{row: a.s.row, col: 0, oldText: string(line[:a.s.col]), kind: editDelete})
+		a.s.recordChange(Change{row: a.s.row, col: 0, oldText: string(line[:a.s.col]), kind: editDelete})
 		a.jump(a.s.row, 0)
 	case tcell.KeyCtrlZ:
 		a.s.undo()
@@ -1472,7 +1472,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if e == nil {
 			line = []rune{ev.Rune()}
 			a.s.lines.PushBack(line)
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     a.s.row,
 				col:     a.s.col,
 				newText: string(ev.Rune()),
@@ -1494,7 +1494,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			a.s.line(a.s.row).Value = line
 			a.s.col += len(newText)
 
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     sel.startRow,
 				col:     sel.startCol,
 				oldText: deletedText,
@@ -1512,7 +1512,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		// No selection, insert rune normally
 		line = e.Value.([]rune)
 		e.Value = slices.Insert(line, a.s.col, ev.Rune())
-		a.s.recordEdit(Edit{
+		a.s.recordChange(Change{
 			row:     a.s.row,
 			col:     a.s.col,
 			newText: string(ev.Rune()),
@@ -1524,7 +1524,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if e == nil {
 			// file end
 			a.s.lines.PushBack([]rune{})
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				newText: "\n",
 				row:     a.s.row,
 				col:     a.s.col,
@@ -1541,7 +1541,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		// no auto-indent for the Enter from clipboard
 		if a.s.col == 0 || time.Since(timeLastKey) < 10*time.Millisecond {
 			a.s.lines.InsertAfter(line[a.s.col:], e)
-			a.s.recordEdit(Edit{newText: "\n", row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.recordChange(Change{newText: "\n", row: a.s.row, col: a.s.col, kind: editInsert})
 			a.jump(a.s.row+1, a.s.col)
 			a.drawEditor()
 			return
@@ -1560,13 +1560,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			nextE := a.s.lines.InsertAfter(indent, e)
 			a.s.lines.InsertAfter(slices.Concat(indent[:n], line[a.s.col:]), nextE)
 			inserted = "\n" + string(indent) + "\n" + string(indent[:n])
-			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.recordChange(Change{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
 			a.jump(a.s.row+1, len(indent))
 		} else {
 			newLine := slices.Concat(indent, line[a.s.col:])
 			a.s.lines.InsertAfter(newLine, e)
 			inserted = "\n" + string(indent)
-			a.s.recordEdit(Edit{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
+			a.s.recordChange(Change{newText: inserted, row: a.s.row, col: a.s.col, kind: editInsert})
 			a.jump(a.s.row+1, len(indent))
 		}
 		a.drawEditor()
@@ -1579,7 +1579,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		if sel := a.s.selected(); sel != nil {
 			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     sel.startRow,
 				col:     sel.startCol,
 				oldText: deletedText,
@@ -1599,17 +1599,18 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				return // no line to delete
 			}
 
-			a.s.lastEdit = nil
-			a.s.undoStack = nil
-			a.s.redoStack = nil
 			element := a.s.line(a.s.row)
 			prevElement := element.Prev()
 			prevLine := prevElement.Value.([]rune)
-			a.s.col = len(prevLine)
 			prevElement.Value = append(prevLine, element.Value.([]rune)...)
 			a.s.lines.Remove(element)
-			a.s.row--
-			a.jump(a.s.row, a.s.col)
+			a.s.recordChange(Change{
+				row:     a.s.row - 1,
+				col:     len(prevLine),
+				oldText: "\n",
+				kind:    editDelete,
+			})
+			a.jump(a.s.row-1, len(prevLine))
 			a.drawEditor()
 			return
 		}
@@ -1619,7 +1620,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		deleted := line[a.s.col-1]
 		line = append(line[:a.s.col-1], line[a.s.col:]...)
 		element.Value = line
-		a.s.recordEdit(Edit{
+		a.s.recordChange(Change{
 			row:     a.s.row,
 			col:     a.s.col - 1,
 			oldText: string(deleted),
@@ -1629,7 +1630,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		a.jump(a.s.row, a.s.col)
 		// a.drawEditorLine(a.s.row, line)
 	case tcell.KeyLeft:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		// move cursor to the start of the selection
 		if selection := a.s.selected(); selection != nil {
 			a.s.row = selection.startRow
@@ -1649,7 +1650,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.jump(a.s.row, a.s.col-1)
 	case tcell.KeyRight:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		// move cursor to the end of the selection
 		if selection := a.s.selected(); selection != nil {
 			a.s.row = selection.endRow
@@ -1674,7 +1675,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.jump(a.s.row+1, 0)
 	case tcell.KeyUp:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		a.unselect()
 
 		if a.s.row == 0 {
@@ -1690,7 +1691,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		col := columnFromScreenWidth(prevLineE.Value.([]rune), a.s.upDownCol)
 		a.jump(a.s.row-1, col)
 	case tcell.KeyDown:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		a.unselect()
 
 		if a.s.row == a.s.lines.Len()-1 {
@@ -1711,7 +1712,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		col := columnFromScreenWidth(nextE.Value.([]rune), a.s.upDownCol)
 		a.jump(a.s.row+1, col)
 	case tcell.KeyHome, tcell.KeyCtrlA:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		a.unselect()
 
 		// move to the first non-whitespace character
@@ -1721,7 +1722,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		}
 		a.jump(a.s.row, leadingWhitespaces(line.Value.([]rune)))
 	case tcell.KeyEnd, tcell.KeyCtrlE:
-		a.s.lastEdit = nil
+		a.s.lastChange = nil
 		a.unselect()
 		a.jump(a.s.row, -1)
 	case tcell.KeyTAB:
@@ -1744,7 +1745,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				newLine = append(newLine, line...)
 				e.Value = newLine
 				a.drawEditorLine(row, newLine)
-				a.s.recordEdit(Edit{row: row, col: 0, newText: "\t", kind: editInsert})
+				a.s.recordChange(Change{row: row, col: 0, newText: "\t", kind: editInsert})
 				if row == a.s.row {
 					a.s.col++
 				}
@@ -1756,13 +1757,13 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		e := a.s.line(a.s.row)
 		if e == nil {
 			e = a.s.lines.PushBack([]rune{'\t'})
-			a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
+			a.s.recordChange(Change{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
 			a.s.col++
 		} else {
 			line := e.Value.([]rune)
 			if a.s.hint != "" {
 				line = slices.Concat(line[:a.s.col-a.s.hintOff], []rune(a.s.hint), line[a.s.col:])
-				a.s.recordEdit(Edit{
+				a.s.recordChange(Change{
 					row:     a.s.row,
 					col:     a.s.col - a.s.hintOff,
 					oldText: string(line[a.s.col-a.s.hintOff : a.s.col]),
@@ -1773,7 +1774,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 				a.s.hint = ""
 			} else {
 				line = slices.Insert(line, a.s.col, '\t')
-				a.s.recordEdit(Edit{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
+				a.s.recordChange(Change{row: a.s.row, col: a.s.col, newText: string("\t"), kind: editInsert})
 				a.s.col++
 			}
 			e.Value = line
@@ -1794,7 +1795,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			if row == a.s.row {
 				a.s.col--
 			}
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     row,
 				col:     0,
 				oldText: "\t",
@@ -1879,7 +1880,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			// Cut the selected text
 			deletedText := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     sel.startRow,
 				col:     sel.startCol,
 				oldText: deletedText,
@@ -1907,7 +1908,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		deletedText := a.s.deleteRange(a.s.row, 0, a.s.row, len(line))
 		screen.SetClipboard([]byte(deletedText))
 		a.s.clipboard = deletedText
-		a.s.recordEdit(Edit{
+		a.s.recordChange(Change{
 			row:     a.s.row,
 			col:     0,
 			oldText: deletedText,
@@ -1922,7 +1923,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 			deleted := a.s.deleteRange(sel.startRow, sel.startCol, sel.endRow, sel.endCol)
 			a.s.selection = nil
 			a.s.insertText([]rune(a.s.clipboard), sel.startRow, sel.startCol)
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     sel.startRow,
 				col:     sel.startCol,
 				oldText: deleted,
@@ -1932,7 +1933,7 @@ func (a *App) editorEvent(ev *tcell.EventKey) {
 		} else {
 			row, col := a.s.row, a.s.col
 			a.s.insertText([]rune(a.s.clipboard), row, col)
-			a.s.recordEdit(Edit{
+			a.s.recordChange(Change{
 				row:     row,
 				col:     col,
 				newText: a.s.clipboard,
@@ -2137,7 +2138,7 @@ const (
 	editReplace
 )
 
-type Edit struct {
+type Change struct {
 	row     int
 	col     int
 	oldText string
@@ -2146,104 +2147,103 @@ type Edit struct {
 	time    time.Time
 }
 
-func reverse(e Edit) Edit {
-	switch e.kind {
+func reverse(c Change) Change {
+	switch c.kind {
 	case editInsert:
-		return Edit{
-			row:     e.row,
-			col:     e.col,
-			oldText: e.newText,
+		return Change{
+			row:     c.row,
+			col:     c.col,
+			oldText: c.newText,
 			kind:    editDelete,
 		}
 	case editDelete:
-		return Edit{
-			row:     e.row,
-			col:     e.col,
-			newText: e.oldText,
+		return Change{
+			row:     c.row,
+			col:     c.col,
+			newText: c.oldText,
 			kind:    editInsert,
 		}
 	case editReplace:
-		return Edit{
-			row:     e.row,
-			col:     e.col,
-			oldText: e.newText,
-			newText: e.oldText,
+		return Change{
+			row:     c.row,
+			col:     c.col,
+			oldText: c.newText,
+			newText: c.oldText,
 			kind:    editReplace,
 		}
 	default:
-		return Edit{}
+		return Change{}
 	}
 }
 
 func (st *State) undo() {
-	if len(st.undoStack) == 0 {
+	if st.changeIndex < 0 {
 		return
 	}
-
-	e := st.undoStack[len(st.undoStack)-1]
-	st.undoStack = st.undoStack[:len(st.undoStack)-1]
-	st.applyEdit(reverse(e))
-	st.redoStack = append(st.redoStack, e)
+	st.applyChange(reverse(st.changes[st.changeIndex]))
+	st.changeIndex--
 }
 
 func (st *State) redo() {
-	if len(st.redoStack) == 0 {
+	if st.changeIndex >= len(st.changes)-1 {
 		return
 	}
-	e := st.redoStack[len(st.redoStack)-1]
-	st.redoStack = st.redoStack[:len(st.redoStack)-1]
-	st.applyEdit(e)
-	st.undoStack = append(st.undoStack, e)
+	st.changeIndex++
+	st.applyChange(st.changes[st.changeIndex])
 }
 
-func (st *State) applyEdit(e Edit) {
-	switch e.kind {
+func (st *State) applyChange(c Change) {
+	switch c.kind {
 	case editInsert:
-		st.insertText([]rune(e.newText), e.row, e.col)
+		st.insertText([]rune(c.newText), c.row, c.col)
 	case editDelete:
-		lines := strings.Split(e.oldText, "\n")
+		lines := strings.Split(c.oldText, "\n")
 		if len(lines) == 1 {
-			st.deleteRange(e.row, e.col, e.row, e.col+len([]rune(e.oldText)))
+			st.deleteRange(c.row, c.col, c.row, c.col+len([]rune(c.oldText)))
 		} else {
-			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
+			st.deleteRange(c.row, c.col, c.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
 		}
 	case editReplace:
-		lines := strings.Split(e.oldText, "\n")
+		lines := strings.Split(c.oldText, "\n")
 		if len(lines) == 1 {
-			st.deleteRange(e.row, e.col, e.row, e.col+len([]rune(e.oldText)))
+			st.deleteRange(c.row, c.col, c.row, c.col+len([]rune(c.oldText)))
 		} else {
-			st.deleteRange(e.row, e.col, e.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
+			st.deleteRange(c.row, c.col, c.row+len(lines)-1, len([]rune(lines[len(lines)-1])))
 		}
-		st.insertText([]rune(e.newText), e.row, e.col)
+		st.insertText([]rune(c.newText), c.row, c.col)
 	}
 }
 
-// recordEdit adds an edit operation to the undo stack with intelligent coalescing.
+// recordChange record change with intelligent coalescing.
 // It merges consecutive edits of the same type that occur within 1 second on the same row
 // to create more intuitive undo/redo behavior.
-func (st *State) recordEdit(e Edit) {
+func (st *State) recordChange(c Change) {
 	now := time.Now()
-	if st.lastEdit != nil && e.kind == st.lastEdit.kind &&
-		e.kind != editReplace && // Skip coalescing for replaces
-		e.row == st.lastEdit.row && now.Sub(st.lastEdit.time) < time.Second {
-		if e.kind == editInsert && st.lastEdit.col+len(st.lastEdit.newText) == e.col {
-			st.lastEdit.newText += e.newText
-			st.lastEdit.time = now
+	if st.lastChange != nil && c.kind == st.lastChange.kind &&
+		c.kind != editReplace && // Skip coalescing for replaces
+		c.row == st.lastChange.row && now.Sub(st.lastChange.time) < time.Second {
+		if c.kind == editInsert && st.lastChange.col+len(st.lastChange.newText) == c.col {
+			st.lastChange.newText += c.newText
+			st.lastChange.time = now
 			return
 		}
 
-		if e.kind == editDelete && e.col == st.lastEdit.col-len(e.oldText) {
-			st.lastEdit.oldText = e.oldText + st.lastEdit.oldText
-			st.lastEdit.col = e.col
-			st.lastEdit.time = now
+		if c.kind == editDelete && c.col == st.lastChange.col-len(c.oldText) {
+			st.lastChange.oldText = c.oldText + st.lastChange.oldText
+			st.lastChange.col = c.col
+			st.lastChange.time = now
 			return
 		}
 	}
 
-	e.time = now
-	st.undoStack = append(st.undoStack, e)
-	st.redoStack = nil
-	st.lastEdit = &st.undoStack[len(st.undoStack)-1]
+	c.time = now
+	if st.changeIndex < len(st.changes) {
+		// clear redo stack on new change
+		st.changes = st.changes[:st.changeIndex+1]
+	}
+	st.changes = append(st.changes, c)
+	st.changeIndex = len(st.changes) - 1
+	st.lastChange = &st.changes[st.changeIndex]
 }
 
 type SymbolKind string
