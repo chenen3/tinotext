@@ -1,6 +1,6 @@
 # Tino Text
 
-A mini text editor around 2k lines of code.
+A simple text editor around 2k lines of code.
 
 Usage:
 ```
