@@ -1,11 +1,11 @@
-# Seyi Text
+# Tino Text
 
 A mini text editor around 2k lines of code.
 
 Usage:
 ```
-go build -o seyi .
-./seyi [file]
+go build -o tino .
+./tino [file]
 ```
 
 Key bindings:

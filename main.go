@@ -453,7 +453,7 @@ const (
 )
 
 func main() {
-	output := os.Getenv("SEYI_LOG_FILE")
+	output := os.Getenv("TINO_LOG_FILE")
 	if output == "" {
 		log.SetOutput(io.Discard)
 	} else {

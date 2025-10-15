@@ -1,4 +1,4 @@
-module seyi
+module tino
 
 go 1.23.3
 
